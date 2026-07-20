@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.main import create_app
@@ -164,11 +165,18 @@ def test_momentum_pipeline_persists_trades_and_equity_reachable_via_api() -> Non
             "requested_price",
             "actual_filled_price",
             "slippage_cost",
+            "stop_loss_price",
+            "take_profit_price",
+            "bracket_status",
         }
         # gateway slippage is baked into every fill: requested != actual
         assert trade["requested_price"] > 0
         assert trade["actual_filled_price"] != trade["requested_price"]
         assert trade["slippage_cost"] > 0
+        # every Phase 5 trade runs under a bracket and exits with a final status
+        assert trade["stop_loss_price"] > 0
+        assert trade["take_profit_price"] > 0
+        assert trade["bracket_status"] in ("HIT_SL", "HIT_TP", "TIME_EXITED")
 
         assert equity[0]["timestamp"].endswith("+00:00") or equity[0]["timestamp"].endswith("Z")
 
@@ -407,3 +415,65 @@ def test_gateway_mode_env_defaults_to_mock_even_when_data_is_live(monkeypatch: A
     monkeypatch.delenv("GATEWAY_MODE", raising=False)
     monkeypatch.setenv("DATA_SOURCE_MODE", "live")
     assert isinstance(_build_gateway(), MockExecutionGateway)
+
+
+# --- Phase 5: active bracket cards --------------------------------------------
+
+
+def test_brackets_endpoint_reports_live_card_math() -> None:
+    """Deterministic card check: pre-register a bracket + last price on the
+    injected gateway and verify the endpoint's distance/RR arithmetic."""
+    import asyncio
+    from datetime import datetime, timezone
+
+    from backend.execution_gateway import MockExecutionGateway
+    from backend.models import BracketOrder, OHLCVBar, Timeframe
+
+    gateway = MockExecutionGateway(latency_range_ms=(0.0, 0.5))
+    asyncio.run(
+        gateway.register_bracket(
+            BracketOrder(
+                order_id="pre-1",
+                engine_type="momentum",
+                ticker="FAKE",  # not traded by the app's engines -> stays active
+                side="long",
+                entry_price=106.0,
+                stop_loss_price=97.75,
+                take_profit_price=119.75,
+                size=5_000.0,
+                created_at=datetime(2026, 7, 20, 9, 35, tzinfo=timezone.utc),
+            )
+        )
+    )
+    gateway.observe_bar(
+        OHLCVBar("FAKE", datetime(2026, 7, 20, 9, 40, tzinfo=timezone.utc), Timeframe.ONE_MINUTE, 110, 111, 109, 110.0, 1_000)
+    )
+
+    app = create_app(
+        "sqlite+aiosqlite:///:memory:",
+        gateway=gateway,
+        momentum_interval_seconds=0.5,
+        swing_interval_seconds=0.5,
+    )
+    with TestClient(app) as client:
+        cards = client.get("/api/brackets").json()
+        card = next(c for c in cards if c["order_id"] == "pre-1")
+
+        assert card["ticker"] == "FAKE"
+        assert card["side"] == "long"
+        assert card["status"] == "ACTIVE"
+        assert card["entry_price"] == 106.0
+        assert card["current_price"] == 110.0
+        assert card["stop_loss_price"] == 97.75
+        assert card["take_profit_price"] == 119.75
+        # distances measured from the live 110 price
+        assert card["tp_distance_pct"] == pytest.approx((119.75 - 110.0) / 110.0 * 100, abs=1e-3)
+        assert card["sl_distance_pct"] == pytest.approx((110.0 - 97.75) / 110.0 * 100, abs=1e-3)
+        # RR from the original bracket geometry: 2.5x ATR vs 1.5x ATR
+        assert card["risk_reward_ratio"] == pytest.approx(13.75 / 8.25, abs=1e-3)
+        assert card["unrealized_pct"] == pytest.approx((110.0 - 106.0) / 106.0 * 100, abs=1e-3)
+
+
+def test_brackets_endpoint_empty_when_no_positions() -> None:
+    with new_client() as client:
+        assert isinstance(client.get("/api/brackets").json(), list)

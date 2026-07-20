@@ -18,7 +18,17 @@ dashboard Asset Selector backed by `POST /api/watchlist` that dynamically resubs
 both engines to any ticker, and a root `.env.example` documenting all configuration.
 Live data and execution are deliberately independent: with the default
 `GATEWAY_MODE=mock` the system is a true paper trader — real charts, simulated fills,
-no real capital at risk.
+no real capital at risk. Phase 5 adds intelligent bracket orders: every entry runs
+with a calculated stop-loss/take-profit pair (momentum: 1.5x/2.5x ATR(14) from
+`backend/utils/indicators.py`; swing: 1% below the latest support-pivot wick / the
+nearest peak-pivot resistance ceiling, with a >2%-profit trail to break-even). The
+*gateway* owns bracket monitoring — engines register levels at entry, feed every
+candle through `check_bracket`, and the gateway detects touches (pessimistic HIT_SL
+when both levels sit inside one candle; gap-throughs fill at the open) and executes
+the exit itself. Trades persist `stop_loss_price`/`take_profit_price`/`bracket_status`
+(ACTIVE/HIT_SL/HIT_TP/TIME_EXITED), `/api/brackets` serves live bracket cards, and
+the dashboard shows them in the Active Target Signals panel with distance-to-target
+and risk-reward readouts.
 
 ## Architecture
 
@@ -64,6 +74,9 @@ no real capital at risk.
   - `backend/reconciliation.py` — `reconcile_on_boot`: diffs the gateway's open
     orders against the `open_positions` table by order id after a crash/restart;
     heals rows missing locally, clears rows already closed at the broker.
+  - `backend/utils/indicators.py` — pure TA math over `OHLCVBar` sequences (pandas):
+    `compute_atr` (rolling-14 True Range mean, `min_periods=1` so early-session
+    estimates exist) and `nearest_resistance` (lowest peak-pivot ceiling above a price).
   - `backend/strategies/momentum_engine.py` — Opening Range Breakout day-trading engine.
   - `backend/strategies/swing_engine.py` — trendline/pivot swing-trading engine.
   - `backend/main.py` — `create_app()` factory; the composition root that wires one

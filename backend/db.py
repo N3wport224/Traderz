@@ -49,6 +49,11 @@ class Trade(Base):
     requested_price: Mapped[float] = mapped_column(Float, default=0.0)
     actual_filled_price: Mapped[float] = mapped_column(Float, default=0.0)
     slippage_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    # Phase 5 bracket levels: the SL/TP the trade ran with (post-trailing) and
+    # how it exited (ACTIVE/HIT_SL/HIT_TP/TIME_EXITED; "" = legacy bracketless).
+    stop_loss_price: Mapped[float] = mapped_column(Float, default=0.0)
+    take_profit_price: Mapped[float] = mapped_column(Float, default=0.0)
+    bracket_status: Mapped[str] = mapped_column(String(16), default="")
 
 
 class OpenPosition(Base):
@@ -143,6 +148,9 @@ class Database:
                     requested_price=trade.requested_price,
                     actual_filled_price=trade.actual_filled_price,
                     slippage_cost=trade.slippage_cost,
+                    stop_loss_price=trade.stop_loss_price,
+                    take_profit_price=trade.take_profit_price,
+                    bracket_status=trade.bracket_status,
                 )
             )
             await session.commit()

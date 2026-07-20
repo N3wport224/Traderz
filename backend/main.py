@@ -326,6 +326,50 @@ def create_app(
         rows = await database.get_trades(SwingEngine.ENGINE_TYPE, asset_ticker=watch["symbol"])
         return [_trade_to_json(row) for row in rows]
 
+    @app.get("/api/brackets")
+    async def active_brackets() -> list[dict[str, Any]]:
+        """Live bracket cards for the dashboard's Active Target Signals panel.
+
+        Distances are signed from the *current* price (falling back to the
+        entry before the first candle is observed): positive = still to travel.
+        """
+        cards: list[dict[str, Any]] = []
+        for bracket in execution_gateway.active_brackets():
+            current = execution_gateway.last_price(bracket.ticker) or bracket.entry_price
+            if bracket.side == "long":
+                tp_distance_pct = (bracket.take_profit_price - current) / current * 100.0
+                sl_distance_pct = (current - bracket.stop_loss_price) / current * 100.0
+                risk = bracket.entry_price - bracket.stop_loss_price
+                reward = bracket.take_profit_price - bracket.entry_price
+            else:
+                tp_distance_pct = (current - bracket.take_profit_price) / current * 100.0
+                sl_distance_pct = (bracket.stop_loss_price - current) / current * 100.0
+                risk = bracket.stop_loss_price - bracket.entry_price
+                reward = bracket.entry_price - bracket.take_profit_price
+            cards.append(
+                {
+                    "order_id": bracket.order_id,
+                    "engine_type": bracket.engine_type,
+                    "ticker": bracket.ticker,
+                    "side": bracket.side,
+                    "status": bracket.status.value,
+                    "entry_price": bracket.entry_price,
+                    "current_price": current,
+                    "stop_loss_price": bracket.stop_loss_price,
+                    "take_profit_price": bracket.take_profit_price,
+                    "tp_distance_pct": round(tp_distance_pct, 4),
+                    "sl_distance_pct": round(sl_distance_pct, 4),
+                    "risk_reward_ratio": round(reward / risk, 4) if risk > 0 else None,
+                    "unrealized_pct": round(
+                        ((current - bracket.entry_price) / bracket.entry_price * 100.0)
+                        * (1 if bracket.side == "long" else -1),
+                        4,
+                    ),
+                    "created_at": _iso_utc(bracket.created_at),
+                }
+            )
+        return cards
+
     @app.get("/api/watchlist")
     async def get_watchlist() -> dict[str, Any]:
         return {"ticker": watch["symbol"], "data_source_mode": source_mode}
@@ -446,6 +490,9 @@ def _trade_to_json(trade: Any) -> dict[str, Any]:
         "requested_price": trade.requested_price,
         "actual_filled_price": trade.actual_filled_price,
         "slippage_cost": trade.slippage_cost,
+        "stop_loss_price": trade.stop_loss_price,
+        "take_profit_price": trade.take_profit_price,
+        "bracket_status": trade.bracket_status,
     }
 
 

@@ -29,6 +29,8 @@ import pandas as pd
 from backend.config import ConfigStore
 from backend.execution_gateway import MockExecutionGateway
 from backend.models import (
+    BracketOrder,
+    BracketStatus,
     ExecutionGateway,
     NullPersistence,
     OHLCVBar,
@@ -41,10 +43,13 @@ from backend.models import (
     TradeSignal,
 )
 from backend.risk_manager import RiskManager
+from backend.utils.indicators import nearest_resistance
 
 PIVOT_WINDOW = 5  # bars on each side required to confirm a pivot; not live-configurable
 HOLD_PERIOD_BARS = 3  # bars held after an alert, for equity/performance tracking
 MAX_BAR_HISTORY = 200  # bounds the rolling buffer so pivot/trendline recomputation stays O(1)-ish per bar
+SUPPORT_WICK_BUFFER_PCT = 0.01  # SL sits 1% below the support pivot's lowest wick
+TRAIL_TRIGGER_PCT = 0.02  # >2% unrealized profit trails the stop to break-even
 
 
 @dataclass(slots=True)
@@ -57,6 +62,9 @@ class _OpenPosition:
     entry_fees: float
     entry_slippage_cost: float
     entry_order_id: str
+    stop_loss_price: float
+    take_profit_price: float
+    trailed_to_breakeven: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +206,29 @@ class SwingEngine:
         peaks = [p for p in self.find_pivots() if p.kind == "peak"]
         return self._fit_trendline(peaks, "resistance")
 
+    def _bracket_levels(self, support_pivots: list[Pivot], entry_price: float) -> tuple[float, float]:
+        """Pivot-structure bracket for a long trendline bounce.
+
+        Stop loss: 1% below the lowest wick of the most recent support pivot
+        backing the trendline (trough pivot prices ARE the bar lows/wicks).
+        Take profit: the nearest historical macro resistance ceiling — the
+        lowest peak-pivot price above the entry; if price is already above
+        every buffered peak, fall back to a 2R target.
+        """
+        latest_support = max(support_pivots, key=lambda p: p.index, default=None)
+        stop_loss = (
+            latest_support.price * (1.0 - SUPPORT_WICK_BUFFER_PCT)
+            if latest_support is not None
+            else entry_price * 0.98
+        )
+        if stop_loss >= entry_price:  # pivot sits above the fill (rare, deep-slip entry)
+            stop_loss = entry_price * 0.98
+
+        peak_prices = [p.price for p in self.find_pivots() if p.kind == "peak"]
+        ceiling = nearest_resistance(peak_prices, entry_price)
+        take_profit = ceiling if ceiling is not None else entry_price + 2.0 * (entry_price - stop_loss)
+        return round(stop_loss, 6), round(take_profit, 6)
+
     @staticmethod
     def is_bullish_engulfing(previous: OHLCVBar, current: OHLCVBar) -> bool:
         """True if `current` is a bullish candle whose body engulfs the prior bearish body."""
@@ -247,12 +278,25 @@ class SwingEngine:
             )
         return fill
 
-    async def _close_position(self, bar: OHLCVBar, reason: str) -> list[TradeSignal]:
+    async def _close_position(
+        self,
+        bar: OHLCVBar,
+        reason: str,
+        *,
+        bracket_status: BracketStatus = BracketStatus.TIME_EXITED,
+        exit_fill: OrderFill | None = None,
+    ) -> list[TradeSignal]:
         position = self._position
         assert position is not None
-        signal_started = time.perf_counter()
-        # Exits are always allowed — approval is instantaneous by design.
-        fill = await self._route_order(SignalAction.SELL, position.notional, bar, signal_started, signal_started)
+        if exit_fill is None:
+            # Market exit outside the bracket (hold-period/halt): drop the
+            # now-moot protective levels, then route the order ourselves.
+            await self._gateway.cancel_bracket(position.entry_order_id)
+            signal_started = time.perf_counter()
+            # Exits are always allowed — approval is instantaneous by design.
+            fill = await self._route_order(SignalAction.SELL, position.notional, bar, signal_started, signal_started)
+        else:
+            fill = exit_fill  # the gateway's bracket monitor already executed it
 
         pct_move = (fill.filled_price - position.entry_price) / position.entry_price
         gross_pnl = pct_move * position.notional
@@ -274,6 +318,9 @@ class SwingEngine:
                 fees=round(fees, 4),
                 slippage_cost=round(slippage_cost, 4),
                 order_id=fill.order_id,
+                bracket_status=bracket_status.value,
+                stop_loss_price=position.stop_loss_price,
+                take_profit_price=position.take_profit_price,
             )
         ]
 
@@ -291,6 +338,9 @@ class SwingEngine:
                 requested_price=position.requested_entry_price,
                 actual_filled_price=position.entry_price,
                 slippage_cost=slippage_cost,
+                stop_loss_price=position.stop_loss_price,
+                take_profit_price=position.take_profit_price,
+                bracket_status=bracket_status.value,
             )
         )
         await self._persistence.record_equity_snapshot(self.ENGINE_TYPE, bar.timestamp, self.equity)
@@ -322,6 +372,7 @@ class SwingEngine:
             # call and never compared across calls, and hold-period tracking uses
             # `_bar_count` (a monotonic counter), not a list index.
             self._bars = self._bars[-self.max_bar_history :]
+        self._gateway.observe_bar(bar)
 
         if not self._risk_manager.can_open_position(bar.timestamp):
             if self._position is not None:
@@ -329,8 +380,40 @@ class SwingEngine:
             return []
 
         if self._position is not None:
-            if self._bar_count - self._position.entry_bar_count >= self.hold_period_bars:
-                return await self._close_position(bar, f"hold_period_{self.hold_period_bars}_bars")
+            position = self._position
+            # The gateway's bracket monitor rules first: it detects an SL/TP
+            # touch on this candle and executes the exit itself.
+            bracket_exit = await self._gateway.check_bracket(position.entry_order_id, bar)
+            if bracket_exit is not None:
+                reason = "stop_loss_hit" if bracket_exit.status is BracketStatus.HIT_SL else "take_profit_hit"
+                return await self._close_position(
+                    bar, reason, bracket_status=bracket_exit.status, exit_fill=bracket_exit.fill
+                )
+
+            # Trailing rule: once the trade is >2% in profit, lift the stop to
+            # the entry price (break-even) so the downside is locked out.
+            trail_trigger = position.entry_price * (1.0 + TRAIL_TRIGGER_PCT)
+            if not position.trailed_to_breakeven and bar.close >= trail_trigger:
+                moved = await self._gateway.adjust_bracket_stop(position.entry_order_id, position.entry_price)
+                position.trailed_to_breakeven = True
+                if moved:
+                    position.stop_loss_price = position.entry_price
+                    return [
+                        self._emit(
+                            SignalAction.ALERT,
+                            bar.close,
+                            bar.timestamp,
+                            "trailing_stop_moved_to_breakeven",
+                            stop_loss_price=position.entry_price,
+                            take_profit_price=position.take_profit_price,
+                            unrealized_pct=round((bar.close - position.entry_price) / position.entry_price, 6),
+                        )
+                    ]
+
+            if self._bar_count - position.entry_bar_count >= self.hold_period_bars:
+                return await self._close_position(
+                    bar, f"hold_period_{self.hold_period_bars}_bars", bracket_status=BracketStatus.TIME_EXITED
+                )
             return []
 
         span = 2 * self.pivot_window + 1
@@ -364,6 +447,21 @@ class SwingEngine:
         approved_at = time.perf_counter()
         fill = await self._route_order(SignalAction.BUY, notional, bar, signal_started, approved_at)
 
+        stop_loss, take_profit = self._bracket_levels(line.pivots, fill.filled_price)
+        await self._gateway.register_bracket(
+            BracketOrder(
+                order_id=fill.order_id,
+                engine_type=self.ENGINE_TYPE,
+                ticker=self.symbol,
+                side="long",
+                entry_price=fill.filled_price,
+                stop_loss_price=stop_loss,
+                take_profit_price=take_profit,
+                size=fill.filled_size,
+                created_at=bar.timestamp,
+            )
+        )
+
         self._position = _OpenPosition(
             entry_price=fill.filled_price,
             entry_bar_count=self._bar_count,
@@ -373,6 +471,8 @@ class SwingEngine:
             entry_fees=fill.fees,
             entry_slippage_cost=fill.slippage_cost,
             entry_order_id=fill.order_id,
+            stop_loss_price=stop_loss,
+            take_profit_price=take_profit,
         )
         await self._persistence.record_open_position(
             OpenPositionRecord(
@@ -388,6 +488,8 @@ class SwingEngine:
             )
         )
 
+        risk = fill.filled_price - stop_loss
+        reward = take_profit - fill.filled_price
         return [
             self._emit(
                 SignalAction.ALERT,
@@ -401,6 +503,9 @@ class SwingEngine:
                 slippage_cost=fill.slippage_cost,
                 order_id=fill.order_id,
                 order_status=fill.status.value,
+                stop_loss_price=stop_loss,
+                take_profit_price=take_profit,
+                risk_reward_ratio=round(reward / risk, 4) if risk > 0 else None,
             )
         ]
 

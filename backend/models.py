@@ -39,6 +39,15 @@ class OrderStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class BracketStatus(str, Enum):
+    """Lifecycle of a bracket order's protective levels."""
+
+    ACTIVE = "ACTIVE"
+    HIT_SL = "HIT_SL"
+    HIT_TP = "HIT_TP"
+    TIME_EXITED = "TIME_EXITED"
+
+
 @dataclass(frozen=True, slots=True)
 class OHLCVBar:
     symbol: str
@@ -87,6 +96,38 @@ class OrderFill:
     timestamp: datetime
 
 
+@dataclass(slots=True)
+class BracketOrder:
+    """A protective SL/TP pair guarding one open position, tracked by the
+    execution gateway from entry fill until an exit (or cancellation).
+
+    Mutable on purpose: a trailing rule may raise `stop_loss_price` while the
+    bracket is ACTIVE (see the swing engine's break-even trail).
+    """
+
+    order_id: str  # the entry fill's order id
+    engine_type: str
+    ticker: str
+    side: str  # "long" | "short"
+    entry_price: float
+    stop_loss_price: float
+    take_profit_price: float
+    size: float  # filled notional the exit order must unwind
+    created_at: datetime
+    status: BracketStatus = BracketStatus.ACTIVE
+
+
+@dataclass(frozen=True, slots=True)
+class BracketExit:
+    """Result of a bracket level being touched: the gateway has already
+    executed the market exit; `fill` is what the position actually closed at."""
+
+    order_id: str
+    status: BracketStatus  # HIT_SL or HIT_TP
+    triggered_price: float  # the SL/TP level that was touched
+    fill: OrderFill
+
+
 @dataclass(frozen=True, slots=True)
 class OpenPositionRecord:
     """A live (not yet closed) position, persisted so a crashed backend can
@@ -124,6 +165,11 @@ class TradeRecord:
     requested_price: float = 0.0
     actual_filled_price: float = 0.0
     slippage_cost: float = 0.0
+    # Bracket levels the trade ran with and how it ultimately exited.
+    # Empty bracket_status marks legacy/bracketless trades.
+    stop_loss_price: float = 0.0
+    take_profit_price: float = 0.0
+    bracket_status: str = ""
 
 
 class ExecutionGateway(Protocol):
@@ -148,6 +194,25 @@ class ExecutionGateway(Protocol):
     ) -> OrderFill: ...
 
     async def fetch_open_orders(self, ticker: str | None = None) -> list[OrderFill]: ...
+
+    # --- bracket order surface (Phase 5) ---
+    # The gateway owns bracket monitoring: engines register SL/TP levels at
+    # entry, then feed it every incoming candle. `check_bracket` both detects a
+    # touched level AND executes the market exit, so engines never self-fill.
+
+    def observe_bar(self, bar: OHLCVBar) -> None: ...
+
+    async def register_bracket(self, bracket: BracketOrder) -> None: ...
+
+    async def check_bracket(self, order_id: str, bar: OHLCVBar) -> BracketExit | None: ...
+
+    async def adjust_bracket_stop(self, order_id: str, new_stop: float) -> bool: ...
+
+    async def cancel_bracket(self, order_id: str) -> BracketOrder | None: ...
+
+    def active_brackets(self) -> list[BracketOrder]: ...
+
+    def last_price(self, ticker: str) -> float | None: ...
 
 
 class OrderFlowTelemetry(Protocol):

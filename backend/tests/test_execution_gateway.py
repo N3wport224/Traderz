@@ -186,3 +186,155 @@ def test_live_gateway_requires_ccxt_or_valid_exchange(monkeypatch: pytest.Monkey
 
 def test_mock_gateway_name_is_mock() -> None:
     assert seeded_gateway().name == "MOCK"
+
+
+# --- Phase 5: bracket order monitor ------------------------------------------
+
+
+from datetime import datetime, timezone
+
+from backend.models import BracketOrder, BracketStatus, OHLCVBar, Timeframe
+
+
+def make_bracket(
+    order_id: str = "o1",
+    side: str = "long",
+    entry: float = 106.0,
+    sl: float = 97.75,
+    tp: float = 119.75,
+    size: float = 5_000.0,
+) -> BracketOrder:
+    return BracketOrder(
+        order_id=order_id,
+        engine_type="momentum",
+        ticker="MOCK",
+        side=side,
+        entry_price=entry,
+        stop_loss_price=sl,
+        take_profit_price=tp,
+        size=size,
+        created_at=datetime(2026, 7, 20, 9, 30, tzinfo=timezone.utc),
+    )
+
+
+def candle(open_: float, high: float, low: float, close: float, symbol: str = "MOCK") -> OHLCVBar:
+    return OHLCVBar(
+        symbol=symbol,
+        timestamp=datetime(2026, 7, 20, 9, 40, tzinfo=timezone.utc),
+        timeframe=Timeframe.ONE_MINUTE,
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=1_000,
+    )
+
+
+def zero_slip() -> MockExecutionGateway:
+    return MockExecutionGateway(min_slippage_pct=0.0, max_slippage_pct=0.0, latency_range_ms=(0.0, 0.0))
+
+
+@pytest.mark.asyncio
+async def test_bracket_untouched_candle_returns_none() -> None:
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket())
+    assert await gateway.check_bracket("o1", candle(106, 110, 100, 108)) is None
+    assert len(gateway.active_brackets()) == 1
+
+
+@pytest.mark.asyncio
+async def test_bracket_low_touching_stop_executes_hit_sl_exit() -> None:
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket())
+    exit_event = await gateway.check_bracket("o1", candle(99, 100, 97.75, 98))  # low == SL exactly
+
+    assert exit_event is not None
+    assert exit_event.status is BracketStatus.HIT_SL
+    assert exit_event.triggered_price == 97.75
+    assert exit_event.fill.signal_type is SignalAction.SELL  # long exit is a market sell
+    assert exit_event.fill.filled_price == pytest.approx(97.75)
+    assert gateway.active_brackets() == []  # consumed
+
+
+@pytest.mark.asyncio
+async def test_bracket_high_touching_target_executes_hit_tp_exit() -> None:
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket())
+    exit_event = await gateway.check_bracket("o1", candle(118, 119.75, 117, 119))  # high == TP exactly
+
+    assert exit_event is not None
+    assert exit_event.status is BracketStatus.HIT_TP
+    assert exit_event.fill.filled_price == pytest.approx(119.75)
+
+
+@pytest.mark.asyncio
+async def test_bracket_sl_wins_when_both_levels_inside_one_candle() -> None:
+    """Intrabar ordering is unknowable from OHLC — resolve pessimistically."""
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket())
+    exit_event = await gateway.check_bracket("o1", candle(106, 125, 95, 110))
+    assert exit_event is not None and exit_event.status is BracketStatus.HIT_SL
+
+
+@pytest.mark.asyncio
+async def test_bracket_gap_through_stop_fills_at_open() -> None:
+    """A candle opening below the stop can't fill at the stop — you get the open."""
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket())
+    exit_event = await gateway.check_bracket("o1", candle(92, 93, 90, 91))
+    assert exit_event is not None
+    assert exit_event.fill.filled_price == pytest.approx(92.0)
+
+
+@pytest.mark.asyncio
+async def test_short_bracket_mirrors_levels_and_exits_with_market_buy() -> None:
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket(side="short", entry=94.0, sl=102.25, tp=80.25))
+    exit_event = await gateway.check_bracket("o1", candle(101, 103, 100, 102))  # high >= short SL
+
+    assert exit_event is not None
+    assert exit_event.status is BracketStatus.HIT_SL
+    assert exit_event.fill.signal_type is SignalAction.BUY  # short exit is a market buy
+
+
+@pytest.mark.asyncio
+async def test_adjust_bracket_stop_never_widens_risk() -> None:
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket(order_id="o6", entry=14.8, sl=13.86, tp=23.0, size=15_000.0))
+
+    assert await gateway.adjust_bracket_stop("o6", 14.8) is True  # trail up to break-even
+    assert await gateway.adjust_bracket_stop("o6", 13.0) is False  # widening refused
+    assert await gateway.adjust_bracket_stop("o6", 25.0) is False  # beyond TP refused
+    assert await gateway.adjust_bracket_stop("missing", 14.0) is False
+    assert gateway.active_brackets()[0].stop_loss_price == 14.8
+
+
+@pytest.mark.asyncio
+async def test_cancel_bracket_removes_without_executing() -> None:
+    gateway = zero_slip()
+    await gateway.register_bracket(make_bracket())
+    fills_before = len(gateway.fills)
+    cancelled = await gateway.cancel_bracket("o1")
+    assert cancelled is not None and cancelled.order_id == "o1"
+    assert await gateway.cancel_bracket("o1") is None
+    assert gateway.active_brackets() == []
+    assert len(gateway.fills) == fills_before  # no exit order was placed
+
+
+@pytest.mark.asyncio
+async def test_register_bracket_validates_level_ordering() -> None:
+    gateway = zero_slip()
+    with pytest.raises(GatewayError):
+        await gateway.register_bracket(make_bracket(sl=110.0))  # long SL above entry
+    with pytest.raises(GatewayError):
+        await gateway.register_bracket(make_bracket(side="short", entry=94.0, sl=80.0, tp=102.0))
+
+
+@pytest.mark.asyncio
+async def test_observe_bar_tracks_last_price_per_ticker() -> None:
+    gateway = zero_slip()
+    gateway.observe_bar(candle(50, 51, 49, 50.5, symbol="AAPL"))
+    gateway.observe_bar(candle(106, 107, 105, 106.4))
+    assert gateway.last_price("AAPL") == 50.5
+    assert gateway.last_price("MOCK") == 106.4
+    assert gateway.last_price("UNSEEN") is None

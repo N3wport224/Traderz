@@ -203,3 +203,36 @@ async def test_open_positions_survive_a_simulated_restart(tmp_path: Path) -> Non
     positions = await restarted.list_open_positions()
     assert [p.entry_order_id for p in positions] == ["mock-9"]
     await restarted.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bracket_columns_round_trip(db: Database) -> None:
+    """Phase 5: SL/TP levels and the bracket outcome are permanently persisted."""
+    await db.record_trade(
+        TradeRecord(
+            engine_type="momentum",
+            asset_ticker="MOCK",
+            entry_timestamp=BASE_TIME,
+            exit_timestamp=BASE_TIME + timedelta(minutes=3),
+            entry_price=106.0,
+            exit_price=119.75,
+            position_size=5000.0,
+            fees=10.0,
+            net_profit=638.58,
+            stop_loss_price=97.75,
+            take_profit_price=119.75,
+            bracket_status="HIT_TP",
+        )
+    )
+    trade = (await db.get_trades("momentum"))[0]
+    assert trade.stop_loss_price == 97.75
+    assert trade.take_profit_price == 119.75
+    assert trade.bracket_status == "HIT_TP"
+
+
+@pytest.mark.asyncio
+async def test_legacy_trades_default_to_empty_bracket_status(db: Database) -> None:
+    await db.record_trade(make_trade())  # helper predates brackets: no bracket args
+    trade = (await db.get_trades("momentum"))[0]
+    assert trade.bracket_status == ""
+    assert trade.stop_loss_price == 0.0

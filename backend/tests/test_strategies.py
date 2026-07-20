@@ -146,15 +146,20 @@ async def test_time_stop_exits_after_20_minutes_without_target_profit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_target_profit_exits_before_time_stop() -> None:
+async def test_take_profit_bracket_exits_before_time_stop() -> None:
+    """ATR(14) over the fixture is exactly 5.5, so a 106 entry runs a
+    97.75/119.75 bracket — a candle tagging 119.75 exits as HIT_TP."""
     engine = MomentumEngine("MOCK", gateway=zero_slip_gateway())
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
 
     entry_signal = (await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106)))[0]
-    exit_signals = await engine.on_bar(make_1m_bar(6, 106.5, 106.8, 106.4, 106.6))  # +0.57% >= 0.5% target
+    assert entry_signal.metadata["stop_loss_price"] == pytest.approx(97.75)
+    assert entry_signal.metadata["take_profit_price"] == pytest.approx(119.75)
+    exit_signals = await engine.on_bar(make_1m_bar(6, 118, 120, 117, 119))  # high touches the TP
 
-    assert exit_signals[0].reason == "target_profit_reached"
+    assert exit_signals[0].reason == "take_profit_hit"
+    assert exit_signals[0].price == pytest.approx(119.75)
     assert exit_signals[0].timestamp - entry_signal.timestamp == timedelta(minutes=1)
 
 
@@ -253,11 +258,11 @@ async def test_net_pnl_reflects_notional_position_size_and_fees() -> None:
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
 
-    await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))  # entry @ 106
-    exit_signals = await engine.on_bar(make_1m_bar(6, 106.5, 106.8, 106.4, 106.6))  # exit @ 106.6
+    await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))  # entry @ 106 (bracket TP = 119.75)
+    exit_signals = await engine.on_bar(make_1m_bar(6, 118, 120, 117, 119))  # TP fills @ 119.75
 
     notional = 100_000.0 * 0.05
-    pct_move = (106.6 - 106.0) / 106.0
+    pct_move = (119.75 - 106.0) / 106.0
     expected_fees = 2 * notional * 0.001  # gateway charges each leg: entry fill + exit fill
     expected_net_pnl = pct_move * notional - expected_fees
 
@@ -272,7 +277,7 @@ async def test_starting_equity_is_used_as_the_base() -> None:
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
     await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))
-    await engine.on_bar(make_1m_bar(6, 106.5, 106.8, 106.4, 106.6))
+    await engine.on_bar(make_1m_bar(6, 118, 120, 117, 119))  # TP hit @ 119.75
 
     assert engine.equity > 500.0  # base + realized pnl, not reset to 0
 
@@ -284,14 +289,17 @@ async def test_closed_trade_and_equity_snapshot_are_persisted() -> None:
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
     await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))
-    await engine.on_bar(make_1m_bar(6, 106.5, 106.8, 106.4, 106.6))
+    await engine.on_bar(make_1m_bar(6, 118, 120, 117, 119))  # TP hit
 
     assert len(persistence.trades) == 1
     trade = persistence.trades[0]
     assert trade.engine_type == "momentum"
     assert trade.asset_ticker == "MOCK"
     assert trade.entry_price == 106
-    assert trade.exit_price == 106.6
+    assert trade.exit_price == pytest.approx(119.75)  # filled at the TP level
+    assert trade.stop_loss_price == pytest.approx(97.75)
+    assert trade.take_profit_price == pytest.approx(119.75)
+    assert trade.bracket_status == "HIT_TP"
     assert trade.net_profit == pytest.approx(engine.equity)
 
     assert len(persistence.equity_snapshots) == 1
@@ -338,8 +346,8 @@ async def test_circuit_breaker_triggered_signal_emitted_on_trip() -> None:
     """A loss that crosses the daily drawdown threshold must, on the very same
     bar, emit both the EXIT for that trade and a CIRCUIT_BREAKER_TRIGGERED alert.
 
-    This engine only closes on target-profit or the time-stop (no stop-loss), so
-    the loss is realized via a 20-minute time-stop exit on an adverse move.
+    With Phase 5 brackets the adverse move hits the ATR stop loss on the very
+    next bar, realizing the loss immediately instead of waiting out a time-stop.
     """
     risk_manager = RiskManager(
         total_capital=10_000.0, max_daily_drawdown_pct=0.01, allocation_pct={"momentum": 1.0, "swing": 1.0}
@@ -356,7 +364,7 @@ async def test_circuit_breaker_triggered_signal_emitted_on_trip() -> None:
             break
 
     assert [s.action for s in signals] == [SignalAction.EXIT, SignalAction.CIRCUIT_BREAKER]
-    assert signals[0].reason == "time_stop_20min"
+    assert signals[0].reason == "stop_loss_hit"
     assert signals[1].reason == "max_daily_drawdown_exceeded"
     assert risk_manager.is_halted(BASE_TIME) is True
 
@@ -578,8 +586,9 @@ async def test_slipping_gateway_slippage_is_recorded_on_the_trade() -> None:
     assert entry.metadata["requested_price"] == 106
     assert entry.metadata["slippage_cost"] > 0
 
-    exit_signals = await engine.on_bar(make_1m_bar(6, 108.0, 108.5, 107.8, 108.2))
+    exit_signals = await engine.on_bar(make_1m_bar(6, 120.5, 122.0, 120.0, 121.0))  # tags the ~119.9 TP
     assert exit_signals[0].action is SignalAction.EXIT
+    assert exit_signals[0].reason == "take_profit_hit"
 
     trade = persistence.trades[0]
     assert trade.requested_price == 106
@@ -602,7 +611,7 @@ async def test_momentum_open_position_is_persisted_and_cleared() -> None:
     assert open_position.side == "long"
     assert open_position.entry_order_id  # gateway order id captured for reconciliation
 
-    await engine.on_bar(make_1m_bar(6, 106.5, 106.8, 106.4, 106.6))  # exit
+    await engine.on_bar(make_1m_bar(6, 118, 120, 117, 119))  # TP hit -> exit
     assert persistence.open_positions == []
     assert persistence.cleared_positions == [("momentum", "MOCK")]
 
@@ -645,7 +654,7 @@ async def test_momentum_data_disconnected_freezes_evaluation() -> None:
     assert engine._position is not None  # still open: no evaluation happened
 
     risk_manager.mark_data_verified("MOCK")
-    signals = await engine.on_bar(make_1m_bar(7, 106.6, 106.9, 106.5, 106.6))
+    signals = await engine.on_bar(make_1m_bar(7, 118, 120, 117, 119))  # tags the 119.75 TP
     assert signals and signals[0].action is SignalAction.EXIT  # normal operation resumes
 
 
@@ -684,3 +693,158 @@ async def test_partial_fill_books_position_at_filled_size() -> None:
     assert signal.metadata["position_size"] == pytest.approx(requested * 0.9)
     assert engine._position is not None
     assert engine._position.notional == pytest.approx(requested * 0.9)
+
+
+# --- Phase 5: bracket orders (ATR + pivot math), deterministic SL/TP exits ----
+
+
+@pytest.mark.asyncio
+async def test_momentum_stop_loss_hit_persists_hit_sl_trade() -> None:
+    """A candle wicking through the 1.5x-ATR stop exits at the stop level and
+    the persisted trade carries the bracket fields + HIT_SL status."""
+    persistence = FakePersistence()
+    engine = MomentumEngine("MOCK", persistence=persistence, gateway=zero_slip_gateway())
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+    await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))  # entry: SL 97.75 / TP 119.75
+
+    exit_signals = await engine.on_bar(make_1m_bar(6, 99, 100, 97, 98))  # low pierces the SL
+    assert exit_signals[0].reason == "stop_loss_hit"
+
+    trade = persistence.trades[0]
+    assert trade.bracket_status == "HIT_SL"
+    assert trade.exit_price == pytest.approx(97.75)
+    assert trade.stop_loss_price == pytest.approx(97.75)
+    assert trade.take_profit_price == pytest.approx(119.75)
+    assert trade.net_profit < 0
+
+
+@pytest.mark.asyncio
+async def test_momentum_short_bracket_mirrors_atr_levels() -> None:
+    """A breakdown SHORT runs SL above and TP below: entry 94 with ATR 5.5
+    gives SL 102.25 / TP 80.25."""
+    engine = MomentumEngine("MOCK", gateway=zero_slip_gateway())
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+
+    entry = (await engine.on_bar(make_1m_bar(5, 96, 96, 93, 94)))[0]
+    assert entry.action is SignalAction.SHORT
+    assert entry.metadata["stop_loss_price"] == pytest.approx(102.25)
+    assert entry.metadata["take_profit_price"] == pytest.approx(80.25)
+
+    exit_signals = await engine.on_bar(make_1m_bar(6, 101, 103, 100, 102))  # high >= short SL
+    assert exit_signals[0].reason == "stop_loss_hit"
+
+
+@pytest.mark.asyncio
+async def test_momentum_time_stop_records_time_exited_status() -> None:
+    persistence = FakePersistence()
+    engine = MomentumEngine("MOCK", persistence=persistence, gateway=zero_slip_gateway())
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+    await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))
+
+    for minute in range(6, 27):  # quiet drift inside the bracket until the time-stop
+        signals = await engine.on_bar(make_1m_bar(minute, 106.1, 106.3, 105.9, 106.1))
+        if signals:
+            break
+    assert signals[0].reason == "time_stop_20min"
+    assert persistence.trades[0].bracket_status == "TIME_EXITED"
+
+
+@pytest.mark.asyncio
+async def test_momentum_entry_reports_risk_reward_ratio() -> None:
+    engine = MomentumEngine("MOCK", gateway=zero_slip_gateway())
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+    entry = (await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106)))[0]
+    # reward/risk = (2.5 * ATR) / (1.5 * ATR)
+    assert entry.metadata["risk_reward_ratio"] == pytest.approx(2.5 / 1.5, abs=1e-3)
+    assert entry.metadata["atr"] == pytest.approx(5.5)
+
+
+@pytest.mark.asyncio
+async def test_swing_bracket_uses_pivot_wick_sl_and_resistance_tp() -> None:
+    """SL sits 1% below the latest support pivot's wick (14 -> 13.86); TP is
+    the nearest peak-pivot ceiling above the 14.8 entry (the 23 highs)."""
+    engine = SwingEngine("MOCK", pivot_window=2, gateway=zero_slip_gateway())
+    for i in range(13):
+        await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
+    await engine.on_bar(BEARISH_BAR_13)
+    alert = (await engine.on_bar(ENGULFING_BAR_14))[0]
+
+    assert alert.metadata["stop_loss_price"] == pytest.approx(13.86)  # 0.99 * 14
+    assert alert.metadata["take_profit_price"] == pytest.approx(23.0)
+
+
+@pytest.mark.asyncio
+async def test_swing_stop_loss_hit_below_pivot_wick() -> None:
+    persistence = FakePersistence()
+    engine = SwingEngine("MOCK", pivot_window=2, persistence=persistence, gateway=zero_slip_gateway())
+    for i in range(13):
+        await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
+    await engine.on_bar(BEARISH_BAR_13)
+    await engine.on_bar(ENGULFING_BAR_14)  # entry 14.8, SL 13.86
+
+    exit_signals = await engine.on_bar(make_4h_bar(15, 14.2, 14.4, 13.5, 13.9))
+    assert exit_signals[0].reason == "stop_loss_hit"
+    assert persistence.trades[0].bracket_status == "HIT_SL"
+    assert persistence.trades[0].exit_price == pytest.approx(13.86)
+
+
+@pytest.mark.asyncio
+async def test_swing_take_profit_hit_at_resistance_ceiling() -> None:
+    persistence = FakePersistence()
+    engine = SwingEngine("MOCK", pivot_window=2, persistence=persistence, gateway=zero_slip_gateway())
+    for i in range(13):
+        await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
+    await engine.on_bar(BEARISH_BAR_13)
+    await engine.on_bar(ENGULFING_BAR_14)
+
+    exit_signals = await engine.on_bar(make_4h_bar(15, 22.0, 23.5, 21.5, 23.2))  # tags the 23.0 ceiling
+    assert exit_signals[0].reason == "take_profit_hit"
+    assert persistence.trades[0].bracket_status == "HIT_TP"
+    assert persistence.trades[0].exit_price == pytest.approx(23.0)
+
+
+@pytest.mark.asyncio
+async def test_swing_trailing_stop_locks_break_even_after_2pct_profit() -> None:
+    """>2% unrealized profit trails the SL to the entry; a later dip to the
+    entry exits at break-even (HIT_SL at the entry price, PnL = -fees only)."""
+    persistence = FakePersistence()
+    engine = SwingEngine("MOCK", pivot_window=2, persistence=persistence, gateway=zero_slip_gateway())
+    for i in range(13):
+        await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
+    await engine.on_bar(BEARISH_BAR_13)
+    await engine.on_bar(ENGULFING_BAR_14)  # entry 14.8; trail trigger = 15.096
+
+    trail_signals = await engine.on_bar(make_4h_bar(15, 15.0, 15.3, 14.9, 15.2))
+    assert trail_signals and trail_signals[0].reason == "trailing_stop_moved_to_breakeven"
+    assert trail_signals[0].metadata["stop_loss_price"] == pytest.approx(14.8)
+
+    exit_signals = await engine.on_bar(make_4h_bar(16, 15.0, 15.1, 14.7, 14.9))  # dips to break-even
+    assert exit_signals[0].reason == "stop_loss_hit"
+    trade = persistence.trades[0]
+    assert trade.exit_price == pytest.approx(14.8)
+    assert trade.stop_loss_price == pytest.approx(14.8)  # the trailed level, not the original 13.86
+    assert trade.bracket_status == "HIT_SL"
+    assert trade.net_profit == pytest.approx(-trade.fees)  # break-even minus fees
+
+
+@pytest.mark.asyncio
+async def test_swing_no_trail_below_trigger_and_hold_period_is_time_exited() -> None:
+    persistence = FakePersistence()
+    engine = SwingEngine("MOCK", pivot_window=2, persistence=persistence, gateway=zero_slip_gateway())
+    for i in range(13):
+        await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
+    await engine.on_bar(BEARISH_BAR_13)
+    await engine.on_bar(ENGULFING_BAR_14)
+
+    # closes stay under the 15.096 trigger and inside the bracket
+    assert await engine.on_bar(make_4h_bar(15, 15.0, 15.05, 14.85, 15.0)) == []
+    assert await engine.on_bar(make_4h_bar(16, 15.0, 15.05, 14.9, 15.05)) == []
+    exit_signals = await engine.on_bar(make_4h_bar(17, 15.0, 15.06, 14.9, 15.0))
+
+    assert exit_signals[0].reason == "hold_period_3_bars"
+    assert persistence.trades[0].bracket_status == "TIME_EXITED"
+    assert persistence.trades[0].stop_loss_price == pytest.approx(13.86)  # never trailed

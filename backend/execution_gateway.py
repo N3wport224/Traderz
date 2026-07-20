@@ -25,7 +25,15 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.models import OrderFill, OrderStatus, SignalAction
+from backend.models import (
+    BracketExit,
+    BracketOrder,
+    BracketStatus,
+    OHLCVBar,
+    OrderFill,
+    OrderStatus,
+    SignalAction,
+)
 
 # Which way an adverse fill moves the price for each order side. Closing a
 # short is a market BUY, closing a long is a market SELL — engines pass the
@@ -47,7 +55,19 @@ class GatewayConfigError(GatewayError):
 
 
 class BaseExecutionGateway(ABC):
-    """Unified order-routing interface for every broker/exchange backend."""
+    """Unified order-routing interface for every broker/exchange backend.
+
+    Also owns the bracket-order monitor (Phase 5): engines register an SL/TP
+    pair when an entry fills, feed every incoming candle through
+    `observe_bar`/`check_bracket`, and the gateway detects touched levels and
+    executes the market exit itself — engines book PnL off the returned fill
+    but never simulate one. The registry lives here (not in the mock) so a live
+    gateway monitors brackets identically, just with real exit orders.
+    """
+
+    def __init__(self) -> None:
+        self._brackets: dict[str, BracketOrder] = {}
+        self._last_prices: dict[str, float] = {}
 
     @property
     @abstractmethod
@@ -87,6 +107,85 @@ class BaseExecutionGateway(ABC):
         shares = filled_size / requested_price
         return round(abs(filled_price - requested_price) * shares, 6)
 
+    # --- bracket order monitor -------------------------------------------------
+
+    def observe_bar(self, bar: OHLCVBar) -> None:
+        """Records the freshest market price per ticker (drives /api/brackets)."""
+        self._last_prices[bar.symbol] = bar.close
+
+    def last_price(self, ticker: str) -> float | None:
+        return self._last_prices.get(ticker)
+
+    async def register_bracket(self, bracket: BracketOrder) -> None:
+        if bracket.stop_loss_price <= 0 or bracket.take_profit_price <= 0:
+            raise GatewayError("bracket SL/TP levels must be positive")
+        if bracket.side == "long" and not bracket.stop_loss_price < bracket.entry_price < bracket.take_profit_price:
+            raise GatewayError("long bracket requires SL < entry < TP")
+        if bracket.side == "short" and not bracket.take_profit_price < bracket.entry_price < bracket.stop_loss_price:
+            raise GatewayError("short bracket requires TP < entry < SL")
+        self._brackets[bracket.order_id] = bracket
+
+    def active_brackets(self) -> list[BracketOrder]:
+        return list(self._brackets.values())
+
+    async def adjust_bracket_stop(self, order_id: str, new_stop: float) -> bool:
+        """Moves an active bracket's stop (trailing rules). Never widens risk:
+        a long's stop only moves up, a short's only down. Returns True if moved."""
+        bracket = self._brackets.get(order_id)
+        if bracket is None:
+            return False
+        if bracket.side == "long":
+            if new_stop <= bracket.stop_loss_price or new_stop >= bracket.take_profit_price:
+                return False
+        else:
+            if new_stop >= bracket.stop_loss_price or new_stop <= bracket.take_profit_price:
+                return False
+        bracket.stop_loss_price = new_stop
+        return True
+
+    async def cancel_bracket(self, order_id: str) -> BracketOrder | None:
+        """Removes a bracket without executing anything (time-stop/manual exits)."""
+        return self._brackets.pop(order_id, None)
+
+    async def check_bracket(self, order_id: str, bar: OHLCVBar) -> BracketExit | None:
+        """Evaluates one candle against an active bracket; executes the exit on a touch.
+
+        A candle whose low reaches the stop *and* whose high reaches the target
+        is resolved pessimistically as HIT_SL — intrabar ordering is unknowable
+        from OHLC data, so the bracket assumes the worst. A candle that gaps
+        past a level fills at its open (you can't exit at a price the market
+        skipped), with normal exit-side slippage applied on top either way.
+        """
+        self.observe_bar(bar)
+        bracket = self._brackets.get(order_id)
+        if bracket is None:
+            return None
+
+        if bracket.side == "long":
+            sl_hit = bar.low <= bracket.stop_loss_price
+            tp_hit = bar.high >= bracket.take_profit_price
+        else:
+            sl_hit = bar.high >= bracket.stop_loss_price
+            tp_hit = bar.low <= bracket.take_profit_price
+        if not sl_hit and not tp_hit:
+            return None
+
+        if sl_hit:  # pessimistic: stop wins when both trigger inside one candle
+            status = BracketStatus.HIT_SL
+            level = bracket.stop_loss_price
+            gapped_through = bar.open < level if bracket.side == "long" else bar.open > level
+        else:
+            status = BracketStatus.HIT_TP
+            level = bracket.take_profit_price
+            gapped_through = bar.open > level if bracket.side == "long" else bar.open < level
+        requested_price = bar.open if gapped_through else level
+
+        exit_action = SignalAction.SELL if bracket.side == "long" else SignalAction.BUY
+        fill = await self.execute_order(exit_action, bracket.size, bracket.ticker, requested_price)
+        bracket.status = status
+        del self._brackets[order_id]
+        return BracketExit(order_id=order_id, status=status, triggered_price=level, fill=fill)
+
 
 class MockExecutionGateway(BaseExecutionGateway):
     """Simulated broker: latency, fees, depth-based slippage, partial fills.
@@ -108,6 +207,7 @@ class MockExecutionGateway(BaseExecutionGateway):
         latency_range_ms: tuple[float, float] = (2.0, 10.0),
         rng: random.Random | None = None,
     ) -> None:
+        super().__init__()
         if min_slippage_pct < 0 or max_slippage_pct < min_slippage_pct:
             raise GatewayConfigError("slippage bounds must satisfy 0 <= min <= max")
         if book_depth_notional <= 0:
@@ -218,6 +318,7 @@ class LiveCCXTExecutionGateway(BaseExecutionGateway):
         api_key: str | None = None,
         api_secret: str | None = None,
     ) -> None:
+        super().__init__()
         key = api_key or os.environ.get("API_KEY")
         secret = api_secret or os.environ.get("API_SECRET")
         if not key or not secret:
