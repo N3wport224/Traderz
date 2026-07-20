@@ -33,14 +33,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.config import ConfigStore, ConfigValidationError
 from backend.data_pipeline import (
     ResilientStream,
+    WebSocketStreamFactory,
     build_stream_factory,
     flaky_stream,
+    is_crypto_symbol,
     resolve_data_source_mode,
 )
 from backend.db import Database
 from backend.engine.backtester import BacktestError, HistoricalTransport, run_backtest
 from backend.execution_gateway import LiveCCXTExecutionGateway, MockExecutionGateway
-from backend.models import ExecutionGateway, OHLCVBar, Timeframe, TradeSignal
+from backend.models import ExecutionGateway, OHLCVBar, SignalAction, Timeframe, TradeSignal
 from backend.notifier import ConsoleNotifier, Notifier, WebhookNotifier
 from backend.reconciliation import reconcile_on_boot
 from backend.risk_manager import RiskManager
@@ -144,9 +146,11 @@ def create_app(
     backoff_scale: float = 1.0,
     symbol: str | None = None,
     data_source_mode: str | None = None,
+    data_transport: str | None = None,
     live_poll_seconds: float | None = None,
     live_http_client: Any | None = None,
     live_exchange: Any | None = None,
+    ws_provider: Any | None = None,
 ) -> FastAPI:
     """Composition root.
 
@@ -180,6 +184,10 @@ def create_app(
     if execution_gateway.risk_guard is None:
         execution_gateway.risk_guard = risk_guard
     source_mode = resolve_data_source_mode(data_source_mode)
+    # rest (default) polls candles; websocket pushes them (live crypto 1m only).
+    transport = (data_transport or os.environ.get("DATA_TRANSPORT", "rest")).lower()
+    if transport not in ("rest", "websocket"):
+        raise ValueError(f"DATA_TRANSPORT must be 'rest' or 'websocket', got {transport!r}")
     momentum_state = EngineState()
     swing_state = EngineState()
     resilient_streams: dict[str, ResilientStream] = {}
@@ -187,8 +195,12 @@ def create_app(
     watch: dict[str, Any] = {
         "symbol": (symbol or os.environ.get("WATCHLIST_SYMBOL", SYMBOL)).upper(),
         "tasks": [],
+        "ws_factory": None,
     }
     watch_lock = asyncio.Lock()
+
+    def _websocket_applies(ticker: str) -> bool:
+        return transport == "websocket" and source_mode == "live" and is_crypto_symbol(ticker)
 
     async def _run_engine_worker(engine: MomentumEngine | SwingEngine, bar_stream: Any, state: EngineState) -> None:
         async for signal in engine.run(bar_stream):
@@ -248,19 +260,62 @@ def create_app(
             telemetry=telemetry,
             starting_equity=await database.get_latest_equity(SwingEngine.ENGINE_TYPE),
         )
-        momentum_stream = _resilient("momentum", ticker, _stream_factory_for(ticker, Timeframe.ONE_MINUTE))
+        if _websocket_applies(ticker):
+            # Push transport: one resilient websocket hub multiplexes 1m bars
+            # to any number of subscribed engines; its disconnect/reconnect
+            # callbacks drive the same DATA_DISCONNECTED semantics as REST.
+            loop = asyncio.get_running_loop()
+
+            def _ws_down(exc: Exception) -> None:
+                risk_manager.mark_data_disconnected(ticker)
+                loop.create_task(
+                    notifier.notify_data_event(
+                        SignalAction.DATA_DISCONNECTED, ticker, datetime.now(timezone.utc), f"websocket_drop: {exc}"
+                    )
+                )
+
+            def _ws_up() -> None:
+                risk_manager.mark_data_verified(ticker)
+                loop.create_task(
+                    notifier.notify_data_event(
+                        SignalAction.DATA_RECONNECTED, ticker, datetime.now(timezone.utc), "websocket_reconnected"
+                    )
+                )
+
+            ws_factory = WebSocketStreamFactory(
+                ticker, ws_provider, backoff_scale=backoff_scale, on_disconnect=_ws_down, on_reconnect=_ws_up
+            )
+            watch["ws_factory"] = ws_factory
+            resilient_streams.pop("momentum", None)  # 1m telemetry comes from the hub now
+            momentum_bar_stream = ws_factory.subscribe("momentum")
+            await ws_factory.start()
+        else:
+            watch["ws_factory"] = None
+            momentum_bar_stream = _resilient(
+                "momentum", ticker, _stream_factory_for(ticker, Timeframe.ONE_MINUTE)
+            ).bars()
+
         swing_stream = _resilient("swing", ticker, _stream_factory_for(ticker, Timeframe.FOUR_HOUR))
         watch["symbol"] = ticker
         watch["tasks"] = [
-            asyncio.create_task(_run_engine_worker(momentum_engine, momentum_stream.bars(), momentum_state)),
+            asyncio.create_task(_run_engine_worker(momentum_engine, momentum_bar_stream, momentum_state)),
             asyncio.create_task(_run_engine_worker(swing_engine, swing_stream.bars(), swing_state)),
         ]
         logger.info(
             "engines started",
-            extra={"event": "engines_started", "ticker": ticker, "data_source_mode": source_mode},
+            extra={
+                "event": "engines_started",
+                "ticker": ticker,
+                "data_source_mode": source_mode,
+                "transport": "websocket" if watch["ws_factory"] is not None else "rest",
+            },
         )
 
     async def _stop_engines() -> None:
+        ws_factory = watch.get("ws_factory")
+        if ws_factory is not None:
+            await ws_factory.stop()
+            watch["ws_factory"] = None
         tasks = watch["tasks"]
         watch["tasks"] = []
         for task in tasks:
@@ -564,6 +619,10 @@ def create_app(
         stats["risk_guard"] = risk_guard.status()
         stats["risk_guard_sync"] = await _guard_sync_status()
         stats["database"] = {"journal_mode": await database.journal_mode()}
+        ws_factory = watch.get("ws_factory")
+        stats["transport"] = "websocket" if ws_factory is not None else "rest"
+        stats["websocket"] = ws_factory.status() if ws_factory is not None else None
+        stats["stream_latency_ms"] = ws_factory.last_latency_ms if ws_factory is not None else None
         stats["streams"] = {
             name: {
                 "state": stream.state.value,

@@ -10,12 +10,14 @@ be driven by separate `asyncio` tasks.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 import numpy as np
@@ -584,3 +586,275 @@ def build_stream_factory(
         return stream_live_stock_bars(symbol, timeframe, client=http_client, poll_seconds=poll_seconds)
 
     return stock_factory
+
+
+# --- Phase 7: real-time WebSocket ingestion -----------------------------------
+#
+# A push-based alternative to REST polling for live 1-minute crypto candles.
+# One `WebSocketStreamFactory` owns a resilient background asyncio message
+# loop: it connects through a provider (default: Binance's keyless public
+# kline stream), survives connection drops with the same 2s->64s exponential
+# backoff discipline as `ResilientStream`, parses raw JSON frames into the
+# standard `OHLCVBar`, and multiplexes every bar out to all subscribed engines
+# simultaneously through bounded per-subscriber asyncio.Queues (pub/sub).
+# Tests inject a scripted fake provider — never the real network.
+
+BINANCE_WS_URL_BASE = "wss://stream.binance.com:9443/ws"
+WS_QUEUE_MAXSIZE = 500  # per-subscriber buffer; oldest bars drop on overflow
+
+
+class WebSocketProvider(Protocol):
+    """Raw-frame source for one symbol's stream. `frames()` connects and
+    yields JSON strings until the connection drops (raise) or closes (return)."""
+
+    def frames(self) -> AsyncIterator[str]: ...
+
+
+class BinanceKlineProvider:
+    """Keyless public Binance kline_1m stream for a crypto pair ("BTC/USDT").
+
+    The `websockets` package is imported lazily so installations that only use
+    mock/REST transports never need a live socket stack at import time.
+    """
+
+    def __init__(self, symbol: str, url_base: str = BINANCE_WS_URL_BASE) -> None:
+        self.symbol = symbol
+        self.url = f"{url_base}/{symbol.replace('/', '').lower()}@kline_1m"
+
+    async def frames(self) -> AsyncIterator[str]:
+        import websockets
+
+        async with websockets.connect(self.url) as connection:
+            async for message in connection:
+                yield message if isinstance(message, str) else message.decode()
+
+
+def parse_kline_frame(raw: str, symbol: str) -> OHLCVBar | None:
+    """Parses a Binance kline frame into a standard 1m bar.
+
+    Only *closed* candles (`k.x == true`) become bars — a still-forming kline
+    would mutate retroactively. Non-kline events and malformed frames return
+    None (the pump skips them; a stream of garbage is a connection problem the
+    disconnect handling deals with, not a parser crash)."""
+    try:
+        payload = json.loads(raw)
+        kline = payload.get("k")
+        if not isinstance(kline, dict) or not kline.get("x"):
+            return None
+        return OHLCVBar(
+            symbol=symbol,
+            timestamp=datetime.fromtimestamp(int(kline["t"]) / 1000.0, tz=timezone.utc),
+            timeframe=Timeframe.ONE_MINUTE,
+            open=float(kline["o"]),
+            high=float(kline["h"]),
+            low=float(kline["l"]),
+            close=float(kline["c"]),
+            volume=int(float(kline.get("v") or 0)),
+        )
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def frame_event_latency_ms(raw: str) -> float | None:
+    """Ingest latency: wall-clock now minus the frame's exchange event time
+    (`E`, epoch ms) — the live 'ping/pong delta' readout on the dashboard."""
+    try:
+        event_ms = json.loads(raw).get("E")
+        if event_ms is None:
+            return None
+        return max(0.0, time.time() * 1000.0 - float(event_ms))
+    except (ValueError, TypeError):
+        return None
+
+
+class _EndOfStream:
+    """Queue sentinel carrying the terminal error (or None for a clean stop)."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: Exception | None) -> None:
+        self.error = error
+
+
+class WebSocketStreamFactory:
+    """Resilient pub/sub hub over one symbol's websocket candle stream.
+
+    `start()` spawns the background message loop; `subscribe()` hands out
+    independent async iterators (each backed by its own bounded queue) so any
+    number of engines consume the same bars simultaneously without coupling.
+    Drops reconnect with exponential backoff (reset only after the next clean
+    frame); `on_disconnect`/`on_reconnect` let the composition root flag the
+    ticker DATA_DISCONNECTED on the shared risk manager exactly like the REST
+    path does. `stop()` (or exhausted retries) ends every subscriber stream —
+    exhausted retries surface as `StreamDisconnected` downstream.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        provider: WebSocketProvider | None = None,
+        *,
+        queue_maxsize: int = WS_QUEUE_MAXSIZE,
+        backoff_initial: float = 2.0,
+        backoff_max: float = 64.0,
+        backoff_scale: float = 1.0,
+        max_retries: int | None = None,
+        on_disconnect: Callable[[Exception], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
+    ) -> None:
+        self.symbol = symbol
+        self._provider: WebSocketProvider = provider or BinanceKlineProvider(symbol)
+        self.queue_maxsize = queue_maxsize
+        self.backoff_initial = backoff_initial
+        self.backoff_max = backoff_max
+        self.backoff_scale = backoff_scale
+        self.max_retries = max_retries
+        self.on_disconnect = on_disconnect
+        self.on_reconnect = on_reconnect
+
+        self.state: StreamState = StreamState.CONNECTED
+        self.disconnect_count = 0
+        self.bars_received = 0
+        self.frames_received = 0
+        self.dropped_bars = 0
+        self.last_latency_ms: float | None = None
+        self._queues: dict[int, asyncio.Queue[OHLCVBar | _EndOfStream]] = {}
+        self._next_queue_id = 0
+        self._pump_task: asyncio.Task[None] | None = None
+        self._stopping = False
+
+    # --- lifecycle -------------------------------------------------------------
+
+    async def start(self) -> None:
+        if self._pump_task is None or self._pump_task.done():
+            self._stopping = False
+            self._pump_task = asyncio.create_task(self._pump())
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            try:
+                await self._pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._pump_task = None
+        self._broadcast_end(None)
+
+    # --- pub/sub ---------------------------------------------------------------
+
+    def subscribe(self, name: str = "") -> AsyncIterator[OHLCVBar]:
+        """An independent bar stream for one consumer. Every subscriber
+        receives every bar (multiplexed); a slow subscriber's oldest bars drop
+        once its own queue overflows, never blocking the pump or its peers.
+
+        The queue registers EAGERLY (at this call), not at first iteration —
+        otherwise bars broadcast between `start()` and the consumer's first
+        `await` would be silently lost to that subscriber."""
+        queue: asyncio.Queue[OHLCVBar | _EndOfStream] = asyncio.Queue(maxsize=self.queue_maxsize)
+        queue_id = self._next_queue_id
+        self._next_queue_id += 1
+        self._queues[queue_id] = queue
+
+        async def _iterate() -> AsyncIterator[OHLCVBar]:
+            try:
+                while True:
+                    item = await queue.get()
+                    if isinstance(item, _EndOfStream):
+                        if item.error is not None:
+                            raise StreamDisconnected(f"websocket stream for {self.symbol} ended: {item.error}")
+                        return
+                    yield item
+            finally:
+                self._queues.pop(queue_id, None)
+
+        return _iterate()
+
+    def _broadcast(self, bar: OHLCVBar) -> None:
+        for queue in self._queues.values():
+            if queue.full():
+                try:
+                    queue.get_nowait()  # drop the oldest for this laggard
+                    self.dropped_bars += 1
+                except asyncio.QueueEmpty:  # pragma: no cover - full implies non-empty
+                    pass
+            queue.put_nowait(bar)
+
+    def _broadcast_end(self, error: Exception | None) -> None:
+        # The termination sentinel must always land, even into a full queue of
+        # a lagging subscriber — evict oldest bars until it fits (a stream that
+        # is ending has no further use for its backlog's oldest entries).
+        for queue in self._queues.values():
+            while True:
+                try:
+                    queue.put_nowait(_EndOfStream(error))
+                    break
+                except asyncio.QueueFull:
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:  # pragma: no cover - full implies non-empty
+                        break
+
+    # --- the resilient message loop -------------------------------------------
+
+    async def _pump(self) -> None:
+        backoff = self.backoff_initial
+        retries = 0
+        reconnecting = False
+        try:
+            while not self._stopping:
+                try:
+                    async for raw in self._provider.frames():
+                        self.frames_received += 1
+                        if reconnecting:
+                            # First clean frame after an outage: integrity is
+                            # re-verified, so the backoff resets like
+                            # ResilientStream's VERIFYING -> CONNECTED edge.
+                            reconnecting = False
+                            retries = 0
+                            backoff = self.backoff_initial
+                            self.state = StreamState.CONNECTED
+                            if self.on_reconnect is not None:
+                                self.on_reconnect()
+                        latency = frame_event_latency_ms(raw)
+                        if latency is not None:
+                            self.last_latency_ms = round(latency, 3)
+                        bar = parse_kline_frame(raw, self.symbol)
+                        if bar is not None:
+                            self.bars_received += 1
+                            self._broadcast(bar)
+                    raise StreamDisconnected("server closed the websocket")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if self._stopping:
+                        return
+                    self.disconnect_count += 1
+                    self.state = StreamState.RECONNECTING
+                    reconnecting = True
+                    logger.warning("websocket stream for %s dropped: %s", self.symbol, exc)
+                    if self.on_disconnect is not None:
+                        self.on_disconnect(exc if isinstance(exc, Exception) else Exception(str(exc)))
+                    retries += 1
+                    if self.max_retries is not None and retries > self.max_retries:
+                        self.state = StreamState.DISCONNECTED
+                        self._broadcast_end(exc)
+                        return
+                    await asyncio.sleep(backoff * self.backoff_scale)
+                    backoff = min(backoff * 2.0, self.backoff_max)
+                    self.state = StreamState.VERIFYING
+        finally:
+            if self._stopping:
+                self.state = StreamState.DISCONNECTED
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "state": self.state.value,
+            "disconnect_count": self.disconnect_count,
+            "frames_received": self.frames_received,
+            "bars_received": self.bars_received,
+            "dropped_bars": self.dropped_bars,
+            "subscribers": len(self._queues),
+            "last_latency_ms": self.last_latency_ms,
+        }

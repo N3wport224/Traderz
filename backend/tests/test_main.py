@@ -641,3 +641,89 @@ def test_telemetry_reports_database_journal_mode(tmp_path: Any) -> None:
     app = create_app(f"sqlite+aiosqlite:///{tmp_path / 'wal.db'}", momentum_interval_seconds=0.5, swing_interval_seconds=0.5)
     with TestClient(app) as client:
         assert client.get("/api/telemetry").json()["database"]["journal_mode"] == "wal"
+
+
+def test_websocket_transport_streams_bars_into_the_momentum_engine() -> None:
+    """DATA_TRANSPORT=websocket + live crypto: 1m bars flow from the (fake)
+    websocket provider through the pub/sub hub into the momentum engine, and
+    telemetry reports the hub's health + stream latency."""
+    import asyncio
+    import json as jsonlib
+
+    base_ms = 1_753_000_000_000
+
+    def kline_frame(i: int) -> str:
+        # a rising walk wide enough to trip an ORB breakout after the range
+        price = 100.0 + i * 1.5
+        return jsonlib.dumps(
+            {
+                "e": "kline",
+                "E": base_ms + i * 60_000 + 25,  # +25ms event lag
+                "k": {
+                    "t": base_ms + i * 60_000,
+                    "o": str(price),
+                    "h": str(price + 2.0),
+                    "l": str(price - 2.0),
+                    "c": str(price + 1.0),
+                    "v": "10",
+                    "x": True,
+                },
+            }
+        )
+
+    class ScriptedProvider:
+        async def frames(self) -> Any:
+            for i in range(40):
+                yield kline_frame(i)
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(3600)  # keep the connection "open"
+
+    class Fake4hExchange:
+        """Keeps the swing engine's REST 4h stream healthy — a broken sibling
+        stream would flag the shared ticker DATA_DISCONNECTED and freeze the
+        momentum engine too (correct behavior, wrong test)."""
+
+        async def fetch_ohlcv(self, symbol: str, timeframe: str, since: Any = None, limit: Any = None) -> list[list[float]]:
+            if since is None:
+                return [[base_ms + i * 14_400_000, 100.0, 101.0, 99.0, 100.5, 10.0] for i in range(3)]
+            return []  # connected, just no new candles yet
+
+    app = create_app(
+        "sqlite+aiosqlite:///:memory:",
+        data_source_mode="live",
+        data_transport="websocket",
+        symbol="BTC/USDT",
+        ws_provider=ScriptedProvider(),
+        live_exchange=Fake4hExchange(),
+        live_poll_seconds=0.05,
+        swing_interval_seconds=0.5,
+        backoff_scale=0.001,
+    )
+    with TestClient(app) as client:
+        telemetry: dict[str, Any] = {}
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            telemetry = client.get("/api/telemetry").json()
+            if (telemetry.get("websocket") or {}).get("bars_received", 0) >= 10:
+                break
+            time.sleep(0.1)
+
+        assert telemetry["transport"] == "websocket"
+        ws = telemetry["websocket"]
+        assert ws["symbol"] == "BTC/USDT"
+        assert ws["state"] == "connected"
+        assert ws["bars_received"] >= 10
+        assert ws["subscribers"] >= 1  # the momentum engine is attached
+        assert telemetry["stream_latency_ms"] is not None  # ping/pong delta tracked
+
+        # the engine actually consumed the pushed bars: breakout signals fired
+        signals = client.get("/api/momentum/signals").json()
+        assert any(s["symbol"] == "BTC/USDT" for s in signals)
+
+
+def test_rest_transport_reports_no_websocket_block() -> None:
+    with new_client() as client:
+        telemetry = client.get("/api/telemetry").json()
+        assert telemetry["transport"] == "rest"
+        assert telemetry["websocket"] is None
+        assert telemetry["stream_latency_ms"] is None

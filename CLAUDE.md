@@ -41,7 +41,23 @@ flag so short covers match the broker-side book instead of registering as entrie
 the gateway books round-trip realized PnL into the guard from its own fill stream.
 `POST /api/system/kill` is the emergency kill switch; `/api/system/guard/reset`
 releases it; the dashboard has a Strategy Analytics & Backtesting tab and a
-flashing RISK GUARD TRIPPED header badge.
+flashing RISK GUARD TRIPPED header badge. Phase 7 adds production state
+persistence and streaming: file-backed SQLite runs in WAL mode
+(`journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout`) with every repository
+method inside the explicit `Database.get_db_session()` commit/rollback scope, so
+concurrent live writes and analytics reads never lock; the `RiskGuard`
+serializes its daily counters to the `system_state` table on every mutation
+(persists are *chained* — never raced — because concurrent same-row upserts
+flush partial field diffs) and reconstructs them at boot with zero amnesia (a
+restored lock re-halts the `RiskManager`; `_roll_day` no longer clears a halt on
+the first observed bar). `DATA_TRANSPORT=websocket` (live crypto 1m) switches
+ingestion from REST polling to `WebSocketStreamFactory`: a resilient asyncio
+message loop over a keyless public kline stream that parses closed candles into
+`OHLCVBar`s and multiplexes them to subscribed engines via bounded per-subscriber
+queues (drop-oldest; subscription queues register eagerly at `subscribe()`).
+Telemetry exposes `database.journal_mode`, `risk_guard_sync` (memory-vs-DB
+comparison), and websocket stream health/latency; the dashboard header is an
+Infrastructure & Connectivity bar.
 
 ## Architecture
 
