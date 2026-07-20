@@ -175,6 +175,8 @@ def create_app(
         risk_manager.total_capital,
         on_trip=lambda reason: risk_manager.halt(f"risk_guard: {reason}"),
     )
+    # Phase 7 crash-safety: every guard mutation upserts the SystemState row.
+    risk_guard.persist_hook = database.save_system_state
     if execution_gateway.risk_guard is None:
         execution_gateway.risk_guard = risk_guard
     source_mode = resolve_data_source_mode(data_source_mode)
@@ -281,6 +283,18 @@ def create_app(
         report = await reconcile_on_boot(execution_gateway, database)
         boot_report.update(report.as_dict())
 
+        # Phase 7 zero-amnesia boot: reconstruct the risk guard's daily
+        # counters/locks from the latest persisted SystemState row, so a
+        # mid-day crash or reboot keeps the seatbelts exactly as they were.
+        persisted_state = await database.load_latest_system_state()
+        if persisted_state is not None and risk_guard.restore(persisted_state):
+            if risk_guard.locked:
+                risk_manager.halt(f"risk_guard: {risk_guard.locked_reason} (restored at boot)")
+                logger.warning(
+                    "risk guard restored in LOCKED state — entries remain blocked",
+                    extra={"event": "risk_guard_restored_locked", "reason": risk_guard.locked_reason},
+                )
+
         if isinstance(execution_gateway, MockExecutionGateway):
             logger.info(
                 "PAPER TRADING: orders fill through the mock gateway (simulated slippage/fees); "
@@ -293,6 +307,7 @@ def create_app(
             yield
         finally:
             await _stop_engines()
+            await risk_guard.flush_persists()  # final state lands before teardown
             await database.dispose()
 
     app = FastAPI(title="Traderz Multi-Engine Trading System", lifespan=lifespan)
@@ -426,10 +441,30 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return asdict(updated)
 
+    async def _guard_sync_status() -> dict[str, Any]:
+        """Sync State indicator: does the in-memory guard exactly match the
+        persisted SystemState row? Operator-facing proof of crash-safety."""
+        snapshot = risk_guard.snapshot()
+        if snapshot["state_date"] is None:
+            return {"persisted": False, "in_sync": True, "detail": "no trading day observed yet"}
+        await risk_guard.flush_persists()  # settle in-flight writes before comparing
+        row = await database.load_system_state(str(snapshot["state_date"]))
+        if row is None:
+            return {"persisted": False, "in_sync": False, "detail": "SystemState row missing for active date"}
+        compared = ("daily_realized_pnl", "daily_entry_count", "locked_reason", "circuit_breaker_active")
+        in_sync = all(row[field] == snapshot[field] for field in compared)
+        return {
+            "persisted": True,
+            "in_sync": in_sync,
+            "last_persisted_at": row["updated_at"],
+            "state_date": snapshot["state_date"],
+        }
+
     @app.get("/api/risk/status")
     async def risk_status() -> dict[str, Any]:
         status = risk_manager.status()
         status["risk_guard"] = risk_guard.status()
+        status["risk_guard_sync"] = await _guard_sync_status()
         return status
 
     @app.post("/api/system/kill")
@@ -527,6 +562,8 @@ def create_app(
         stats["ticker"] = watch["symbol"]
         stats["data_source_mode"] = source_mode
         stats["risk_guard"] = risk_guard.status()
+        stats["risk_guard_sync"] = await _guard_sync_status()
+        stats["database"] = {"journal_mode": await database.journal_mode()}
         stats["streams"] = {
             name: {
                 "state": stream.state.value,

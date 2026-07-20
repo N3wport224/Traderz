@@ -52,7 +52,14 @@ class RiskManager:
 
     def _roll_day(self, timestamp: datetime) -> None:
         today = timestamp.date()
-        if self._current_date is None or today != self._current_date:
+        if self._current_date is None:
+            # First bar ever observed: adopt the date but do NOT clear a halt —
+            # a boot-time restore (Phase 7 crash recovery) may have re-halted us
+            # before any bar arrived, and that lock must survive until a real
+            # calendar rollover.
+            self._current_date = today
+            return
+        if today != self._current_date:
             self._current_date = today
             self._daily_pnl = 0.0
             self._halted = False

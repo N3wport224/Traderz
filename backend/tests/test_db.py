@@ -236,3 +236,126 @@ async def test_legacy_trades_default_to_empty_bracket_status(db: Database) -> No
     trade = (await db.get_trades("momentum"))[0]
     assert trade.bracket_status == ""
     assert trade.stop_loss_price == 0.0
+
+
+# --- Phase 7: WAL mode, session scope, SystemState persistence ---------------
+
+
+@pytest.mark.asyncio
+async def test_file_database_runs_in_wal_mode(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'wal.db'}")
+    await database.init()
+    assert await database.journal_mode() == "wal"
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_in_memory_database_keeps_memory_journal(db: Database) -> None:
+    assert await db.journal_mode() == "memory"  # WAL applies to file DBs only
+
+
+@pytest.mark.asyncio
+async def test_get_db_session_commits_on_success_and_rolls_back_on_error(db: Database) -> None:
+    from backend.db import Trade
+
+    async with db.get_db_session() as session:
+        session.add(
+            Trade(
+                engine_type="momentum",
+                asset_ticker="MOCK",
+                entry_timestamp=BASE_TIME,
+                exit_timestamp=BASE_TIME,
+                entry_price=1.0,
+                exit_price=1.0,
+                position_size=1.0,
+                fees=0.0,
+                net_profit=0.0,
+            )
+        )
+    assert len(await db.get_trades("momentum")) == 1  # committed by the scope
+
+    with pytest.raises(RuntimeError):
+        async with db.get_db_session() as session:
+            session.add(
+                Trade(
+                    engine_type="momentum",
+                    asset_ticker="MOCK",
+                    entry_timestamp=BASE_TIME,
+                    exit_timestamp=BASE_TIME,
+                    entry_price=2.0,
+                    exit_price=2.0,
+                    position_size=1.0,
+                    fees=0.0,
+                    net_profit=0.0,
+                )
+            )
+            raise RuntimeError("boom")
+    assert len(await db.get_trades("momentum")) == 1  # rolled back
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writers_and_readers_never_lock(tmp_path: Path) -> None:
+    """WAL + busy_timeout + scoped sessions: parallel streams of writes and
+    analytics reads must complete without 'database is locked'."""
+    import asyncio
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'concurrent.db'}")
+    await database.init()
+
+    async def writer(worker: int) -> None:
+        for i in range(10):
+            await database.record_trade(make_trade("momentum", offset_minutes=worker * 100 + i))
+
+    async def reader() -> None:
+        for _ in range(20):
+            await database.get_trades("momentum")
+            await database.total_slippage_cost()
+
+    await asyncio.gather(*[writer(w) for w in range(5)], *[reader() for _ in range(5)])
+    assert len(await database.get_trades("momentum")) == 50
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_system_state_upsert_and_load(db: Database) -> None:
+    await db.save_system_state(
+        {
+            "state_date": "2026-07-20",
+            "daily_realized_pnl": -1250.5,
+            "daily_entry_count": 7,
+            "locked_reason": "",
+            "circuit_breaker_active": False,
+        }
+    )
+    await db.save_system_state(
+        {
+            "state_date": "2026-07-20",  # same date -> update, not a second row
+            "daily_realized_pnl": -3100.0,
+            "daily_entry_count": 9,
+            "locked_reason": "max_daily_loss_3.00%_exceeded",
+            "circuit_breaker_active": False,
+        }
+    )
+    row = await db.load_system_state("2026-07-20")
+    assert row is not None
+    assert row["daily_realized_pnl"] == -3100.0
+    assert row["daily_entry_count"] == 9
+    assert "max_daily_loss" in row["locked_reason"]
+    assert row["updated_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_load_latest_system_state_picks_newest_date(db: Database) -> None:
+    assert await db.load_latest_system_state() is None
+    for day, pnl in (("2026-07-18", 5.0), ("2026-07-20", -40.0), ("2026-07-19", 10.0)):
+        await db.save_system_state(
+            {
+                "state_date": day,
+                "daily_realized_pnl": pnl,
+                "daily_entry_count": 1,
+                "locked_reason": "",
+                "circuit_breaker_active": False,
+            }
+        )
+    latest = await db.load_latest_system_state()
+    assert latest is not None and latest["state_date"] == "2026-07-20"

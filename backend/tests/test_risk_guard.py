@@ -225,3 +225,137 @@ async def test_bracket_exit_flows_bypass_the_guard() -> None:
     bar = OHLCVBar("MOCK", datetime(2026, 7, 20, 9, 40, tzinfo=tz.utc), Timeframe.ONE_MINUTE, 99, 100, 97, 98, 1_000)
     exit_event = await gateway.check_bracket("mock-1", bar)
     assert exit_event is not None and exit_event.status is BracketStatus.HIT_SL  # filled despite the lock
+
+
+# --- Phase 7: state serialization & crash recovery ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_every_mutation_schedules_a_persist() -> None:
+    saved: list[dict[str, object]] = []
+
+    async def hook(snapshot: dict[str, object]) -> None:
+        saved.append(snapshot)
+
+    guard = make_guard()
+    guard.persist_hook = hook
+    guard.roll_day(DAY_1)  # first day observed
+    guard.register_entry(DAY_1)
+    guard.record_realized_pnl(-500.0, DAY_1)
+    guard.force_circuit_breaker(True)
+    guard.reset()
+    await guard.flush_persists()
+
+    assert len(saved) >= 5
+    last = saved[-1]
+    assert last["state_date"] == "2026-07-20"
+    assert last["daily_realized_pnl"] == 0.0  # snapshots are captured (and ordered) at schedule time
+
+
+@pytest.mark.asyncio
+async def test_trip_snapshot_carries_the_lock_reason() -> None:
+    saved: list[dict[str, object]] = []
+
+    async def hook(snapshot: dict[str, object]) -> None:
+        saved.append(snapshot)
+
+    guard = make_guard()
+    guard.persist_hook = hook
+    guard.record_realized_pnl(-9_000.0, DAY_1)  # trips
+    await guard.flush_persists()
+    assert any("max_daily_loss" in str(s["locked_reason"]) for s in saved)
+
+
+def test_persist_hook_is_noop_outside_event_loop() -> None:
+    async def hook(snapshot: dict[str, object]) -> None:  # pragma: no cover
+        raise AssertionError("must not run")
+
+    guard = make_guard()
+    guard.persist_hook = hook
+    guard.register_entry(DAY_1)  # sync context: silently skipped, no crash
+    assert guard.status()["daily_entry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mid_day_crash_recovery_restores_exact_counters(tmp_path: Any) -> None:
+    """Session 1 books entries + losses and 'crashes'; session 2 restores from
+    the SystemState table and trips at the ORIGINAL cumulative threshold."""
+    from backend.db import Database
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'guard.db'}"
+    first_db = Database(url)
+    await first_db.init()
+    first_guard = make_guard()  # -3000 threshold
+    first_guard.persist_hook = first_db.save_system_state
+    first_guard.register_entry(DAY_1)
+    first_guard.register_entry(DAY_1)
+    first_guard.record_realized_pnl(-1_800.0, DAY_1)
+    await first_guard.flush_persists()
+    await first_db.dispose()  # crash
+
+    second_db = Database(url)
+    await second_db.init()
+    second_guard = make_guard()
+    second_guard.persist_hook = second_db.save_system_state
+    state = await second_db.load_latest_system_state()
+    assert state is not None and second_guard.restore(state) is True
+
+    status = second_guard.status()
+    assert status["daily_realized_pnl"] == pytest.approx(-1_800.0)
+    assert status["daily_entry_count"] == 2
+    assert status["locked"] is False
+
+    # zero amnesia: only -1200 more is needed to trip, not a fresh -3000
+    second_guard.record_realized_pnl(-1_300.0, DAY_1)
+    assert second_guard.locked is True
+    await second_guard.flush_persists()
+    await second_db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tripped_lock_survives_reboot_and_clears_next_day(tmp_path: Any) -> None:
+    from backend.db import Database
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'locked.db'}"
+    first_db = Database(url)
+    await first_db.init()
+    first_guard = make_guard()
+    first_guard.persist_hook = first_db.save_system_state
+    first_guard.record_realized_pnl(-9_000.0, DAY_1)  # trip + persist
+    await first_guard.flush_persists()
+    await first_db.dispose()
+
+    second_db = Database(url)
+    await second_db.init()
+    second_guard = make_guard()
+    state = await second_db.load_latest_system_state()
+    assert state is not None and second_guard.restore(state)
+    assert second_guard.locked is True  # seatbelt still fastened after reboot
+    with pytest.raises(RiskGuardTripped):
+        second_guard.validate_entry(DAY_1)
+
+    second_guard.roll_day(DAY_2)  # daily lock releases with the calendar
+    assert second_guard.locked is False
+    await second_db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_restored_manual_breaker_survives_but_env_true_wins_either_way() -> None:
+    guard = make_guard()
+    assert guard.restore(
+        {
+            "state_date": "2026-07-20",
+            "daily_realized_pnl": 0.0,
+            "daily_entry_count": 0,
+            "locked_reason": "",
+            "circuit_breaker_active": True,  # kill switch was engaged pre-crash
+        }
+    )
+    assert guard.locked is True
+    assert guard.locked_reason == "circuit_breaker_forced"
+
+
+def test_restore_rejects_empty_snapshot() -> None:
+    guard = make_guard()
+    assert guard.restore({"state_date": None}) is False
+    assert guard.restore({}) is False

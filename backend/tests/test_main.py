@@ -590,3 +590,54 @@ def test_risk_guard_env_limits_flow_into_status(monkeypatch: Any) -> None:
         guard = client.get("/api/risk/status").json()["risk_guard"]
         assert guard["max_daily_loss_pct"] == 0.02
         assert guard["max_daily_trade_count"] == 9
+
+
+# --- Phase 7: guard persistence at app level, sync state, DB mode -------------
+
+
+def test_kill_switch_survives_an_app_restart(tmp_path: Any) -> None:
+    """Engage the kill switch, tear the app down, boot a fresh app over the
+    same database file: the guard must come back LOCKED (zero amnesia)."""
+    url = f"sqlite+aiosqlite:///{tmp_path / 'restart.db'}"
+
+    app1 = create_app(url, momentum_interval_seconds=0.05, swing_interval_seconds=0.05)
+    with TestClient(app1) as client:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:  # wait for a bar so the guard has a trading date
+            guard = client.get("/api/risk/status").json()["risk_guard"]
+            if guard["current_date"]:
+                break
+            time.sleep(0.1)
+        killed = client.post("/api/system/kill").json()
+        assert killed["risk_guard"]["locked"] is True
+
+    app2 = create_app(url, momentum_interval_seconds=0.5, swing_interval_seconds=0.5)
+    with TestClient(app2) as client:
+        status = client.get("/api/risk/status").json()
+        assert status["risk_guard"]["locked"] is True  # restored from SystemState
+        assert status["risk_guard"]["circuit_breaker_active"] is True
+        assert status["halted"] is True  # boot restore re-halted the risk manager
+
+        released = client.post("/api/system/guard/reset").json()
+        assert released["risk_guard"]["locked"] is False
+
+
+def test_risk_guard_sync_indicator_confirms_persistence() -> None:
+    app = create_app("sqlite+aiosqlite:///:memory:", momentum_interval_seconds=0.05, swing_interval_seconds=0.05)
+    with TestClient(app) as client:
+        sync: dict[str, Any] = {}
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not sync.get("persisted"):
+            time.sleep(0.1)
+            sync = client.get("/api/risk/status").json()["risk_guard_sync"]
+        assert sync["persisted"] is True
+        assert sync["in_sync"] is True  # memory state exactly matches the DB row
+        assert sync["last_persisted_at"] is not None
+
+
+def test_telemetry_reports_database_journal_mode(tmp_path: Any) -> None:
+    with new_client() as client:  # in-memory app
+        assert client.get("/api/telemetry").json()["database"]["journal_mode"] == "memory"
+    app = create_app(f"sqlite+aiosqlite:///{tmp_path / 'wal.db'}", momentum_interval_seconds=0.5, swing_interval_seconds=0.5)
+    with TestClient(app) as client:
+        assert client.get("/api/telemetry").json()["database"]["journal_mode"] == "wal"
