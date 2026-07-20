@@ -177,3 +177,73 @@ def test_status_snapshot_reports_halted_reason_after_trip() -> None:
     assert snapshot["halted"] is True
     assert snapshot["halted_reason"] is not None
     assert "swing" in str(snapshot["halted_reason"])
+
+
+# --- Phase 3: DATA_DISCONNECTED state ----------------------------------------
+
+BASE_TIME = DAY_1
+
+
+def test_data_disconnected_blocks_entries_for_that_ticker_only() -> None:
+    rm = RiskManager()
+    rm.mark_data_disconnected("MOCK")
+
+    assert rm.can_open_position(BASE_TIME, ticker="MOCK") is False
+    assert rm.can_open_position(BASE_TIME, ticker="OTHER") is True
+    assert rm.can_open_position(BASE_TIME) is True  # ticker-agnostic callers unaffected
+
+
+def test_mark_data_verified_clears_the_block() -> None:
+    rm = RiskManager()
+    rm.mark_data_disconnected("MOCK")
+    assert rm.is_data_disconnected("MOCK") is True
+    assert rm.is_data_disconnected() is True
+
+    rm.mark_data_verified("MOCK")
+    assert rm.is_data_disconnected("MOCK") is False
+    assert rm.is_data_disconnected() is False
+    assert rm.can_open_position(BASE_TIME, ticker="MOCK") is True
+
+
+def test_mark_data_verified_is_safe_when_not_disconnected() -> None:
+    rm = RiskManager()
+    rm.mark_data_verified("NEVER_MARKED")  # must not raise
+    assert rm.is_data_disconnected() is False
+
+
+def test_system_status_reports_data_disconnected() -> None:
+    rm = RiskManager()
+    rm.mark_data_disconnected("MOCK")
+    assert rm.system_status() == "DATA_DISCONNECTED"
+
+    status = rm.status()
+    assert status["data_disconnected"] is True
+    assert status["disconnected_tickers"] == ["MOCK"]
+
+
+def test_drawdown_halt_outranks_data_disconnected_in_status() -> None:
+    """An active circuit breaker is the more severe condition — it must win the
+    single system_status slot even while a stream is also down."""
+    rm = RiskManager(total_capital=10_000.0, max_daily_drawdown_pct=0.01)
+    rm.record_realized_pnl("momentum", -200.0, BASE_TIME)  # trips the breaker
+    rm.mark_data_disconnected("MOCK")
+    assert rm.system_status() == "HALTED_BY_DRAWDOWN"
+
+
+def test_data_disconnected_outranks_paused_in_status() -> None:
+    rm = RiskManager()
+    rm.pause()
+    rm.mark_data_disconnected("MOCK")
+    assert rm.system_status() == "DATA_DISCONNECTED"
+    rm.mark_data_verified("MOCK")
+    assert rm.system_status() == "PAUSED"
+
+
+def test_multiple_disconnected_tickers_all_reported_sorted() -> None:
+    rm = RiskManager()
+    rm.mark_data_disconnected("ZED")
+    rm.mark_data_disconnected("ABC")
+    assert rm.disconnected_tickers == ["ABC", "ZED"]
+    rm.mark_data_verified("ZED")
+    assert rm.disconnected_tickers == ["ABC"]
+    assert rm.system_status() == "DATA_DISCONNECTED"  # one broken ticker is enough

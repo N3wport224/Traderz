@@ -142,3 +142,34 @@ async def test_webhook_notifier_swallows_http_errors() -> None:
     sink = WebhookNotifier("https://example.invalid/webhook", client=client)
     await sink.send("should not raise")  # must not propagate the HTTP error
     await client.aclose()
+
+
+# --- Phase 3: data-integrity events -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_notifier_dispatches_data_disconnected_and_reconnected() -> None:
+    sink = RecordingSink()
+    notifier = Notifier([sink])
+    await notifier.notify_data_event(
+        SignalAction.DATA_DISCONNECTED, "MOCK", BASE_TIME, "stream_disconnected: boom"
+    )
+    await notifier.notify_data_event(
+        SignalAction.DATA_RECONNECTED, "MOCK", BASE_TIME, "stream_verified_after_1_disconnects"
+    )
+
+    assert len(sink.messages) == 2
+    assert "DATA_DISCONNECTED" in sink.messages[0]
+    assert "MOCK" in sink.messages[0]
+    assert "stream disconnected: boom" in sink.messages[0]  # reason with underscores prettified
+    assert "DATA_RECONNECTED" in sink.messages[1]
+
+
+@pytest.mark.asyncio
+async def test_data_event_signals_pass_the_notifiable_filter() -> None:
+    """DATA_* actions are in NOTIFIABLE_ACTIONS — a plain notify_signal with a
+    synthesized data signal must not be silently dropped like EXIT/ALERT are."""
+    sink = RecordingSink()
+    notifier = Notifier([sink])
+    await notifier.notify_signal(make_signal(SignalAction.DATA_DISCONNECTED, "stream_disconnected"))
+    assert len(sink.messages) == 1

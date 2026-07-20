@@ -9,12 +9,27 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from backend.config import ConfigStore, MomentumConfig, SwingConfig
-from backend.models import OHLCVBar, SignalAction, Timeframe, TradeRecord
+from backend.execution_gateway import MockExecutionGateway
+from backend.models import OHLCVBar, OpenPositionRecord, SignalAction, Timeframe, TradeRecord
 from backend.risk_manager import RiskManager
 from backend.strategies.momentum_engine import MomentumEngine
 from backend.strategies.swing_engine import SwingEngine
 
 BASE_TIME = datetime(2026, 7, 20, 9, 30, tzinfo=timezone.utc)
+
+
+def zero_slip_gateway(fee_rate: float = 0.0005) -> MockExecutionGateway:
+    """Deterministic gateway: fills instantly at exactly the requested price.
+
+    Used wherever a test asserts exact prices/Pnl — the default gateway's
+    randomized slippage would make those assertions flaky.
+    """
+    return MockExecutionGateway(
+        fee_rate=fee_rate,
+        min_slippage_pct=0.0,
+        max_slippage_pct=0.0,
+        latency_range_ms=(0.0, 0.0),
+    )
 
 
 class FakePersistence:
@@ -23,12 +38,28 @@ class FakePersistence:
     def __init__(self) -> None:
         self.trades: list[TradeRecord] = []
         self.equity_snapshots: list[tuple[str, datetime, float]] = []
+        self.open_positions: list[OpenPositionRecord] = []
+        self.cleared_positions: list[tuple[str, str]] = []
 
     async def record_trade(self, trade: TradeRecord) -> None:
         self.trades.append(trade)
 
     async def record_equity_snapshot(self, engine_type: str, timestamp: datetime, equity: float) -> None:
         self.equity_snapshots.append((engine_type, timestamp, equity))
+
+    async def record_open_position(self, position: OpenPositionRecord) -> None:
+        self.open_positions.append(position)
+
+    async def clear_open_position(self, engine_type: str, asset_ticker: str) -> None:
+        self.cleared_positions.append((engine_type, asset_ticker))
+        self.open_positions = [
+            p for p in self.open_positions if not (p.engine_type == engine_type and p.asset_ticker == asset_ticker)
+        ]
+
+    async def list_open_positions(self, engine_type: str | None = None) -> list[OpenPositionRecord]:
+        if engine_type is None:
+            return list(self.open_positions)
+        return [p for p in self.open_positions if p.engine_type == engine_type]
 
 
 def make_1m_bar(minute_offset: int, open_: float, high: float, low: float, close: float) -> OHLCVBar:
@@ -68,7 +99,7 @@ async def test_opening_range_established_with_no_signal() -> None:
 
 @pytest.mark.asyncio
 async def test_breakout_above_high_triggers_buy() -> None:
-    engine = MomentumEngine("MOCK")
+    engine = MomentumEngine("MOCK", gateway=zero_slip_gateway())
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
 
@@ -82,7 +113,7 @@ async def test_breakout_above_high_triggers_buy() -> None:
 
 @pytest.mark.asyncio
 async def test_breakdown_below_low_triggers_short() -> None:
-    engine = MomentumEngine("MOCK")
+    engine = MomentumEngine("MOCK", gateway=zero_slip_gateway())
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
 
@@ -116,7 +147,7 @@ async def test_time_stop_exits_after_20_minutes_without_target_profit() -> None:
 
 @pytest.mark.asyncio
 async def test_target_profit_exits_before_time_stop() -> None:
-    engine = MomentumEngine("MOCK")
+    engine = MomentumEngine("MOCK", gateway=zero_slip_gateway())
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
 
@@ -217,8 +248,8 @@ async def test_position_size_respects_risk_manager_allocation() -> None:
 
 @pytest.mark.asyncio
 async def test_net_pnl_reflects_notional_position_size_and_fees() -> None:
-    risk_manager = RiskManager(total_capital=100_000.0, allocation_pct={"momentum": 0.05, "swing": 0.15}, fee_rate=0.001)
-    engine = MomentumEngine("MOCK", risk_manager=risk_manager)
+    risk_manager = RiskManager(total_capital=100_000.0, allocation_pct={"momentum": 0.05, "swing": 0.15})
+    engine = MomentumEngine("MOCK", risk_manager=risk_manager, gateway=zero_slip_gateway(fee_rate=0.001))
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
 
@@ -227,7 +258,7 @@ async def test_net_pnl_reflects_notional_position_size_and_fees() -> None:
 
     notional = 100_000.0 * 0.05
     pct_move = (106.6 - 106.0) / 106.0
-    expected_fees = notional * 0.001
+    expected_fees = 2 * notional * 0.001  # gateway charges each leg: entry fill + exit fill
     expected_net_pnl = pct_move * notional - expected_fees
 
     assert exit_signals[0].metadata["pnl"] == pytest.approx(round(expected_net_pnl, 4))
@@ -237,7 +268,7 @@ async def test_net_pnl_reflects_notional_position_size_and_fees() -> None:
 
 @pytest.mark.asyncio
 async def test_starting_equity_is_used_as_the_base() -> None:
-    engine = MomentumEngine("MOCK", starting_equity=500.0)
+    engine = MomentumEngine("MOCK", starting_equity=500.0, gateway=zero_slip_gateway())
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
     await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))
@@ -249,7 +280,7 @@ async def test_starting_equity_is_used_as_the_base() -> None:
 @pytest.mark.asyncio
 async def test_closed_trade_and_equity_snapshot_are_persisted() -> None:
     persistence = FakePersistence()
-    engine = MomentumEngine("MOCK", persistence=persistence)
+    engine = MomentumEngine("MOCK", persistence=persistence, gateway=zero_slip_gateway())
     for bar in OPENING_RANGE_BARS:
         await engine.on_bar(bar)
     await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))
@@ -383,7 +414,7 @@ def test_find_pivots_detects_local_trough() -> None:
 
 @pytest.mark.asyncio
 async def test_trendline_retest_with_bullish_engulfing_triggers_alert() -> None:
-    engine = SwingEngine("MOCK", pivot_window=2)
+    engine = SwingEngine("MOCK", pivot_window=2, gateway=zero_slip_gateway())
 
     for i in range(13):
         assert await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i])) == []
@@ -489,7 +520,9 @@ async def test_swing_position_size_respects_risk_manager_allocation() -> None:
 @pytest.mark.asyncio
 async def test_swing_closed_trade_is_persisted_after_hold_period() -> None:
     persistence = FakePersistence()
-    engine = SwingEngine("MOCK", pivot_window=2, hold_period_bars=3, persistence=persistence)
+    engine = SwingEngine(
+        "MOCK", pivot_window=2, hold_period_bars=3, persistence=persistence, gateway=zero_slip_gateway()
+    )
 
     for i in range(13):
         await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
@@ -518,3 +551,136 @@ async def test_swing_halted_risk_manager_blocks_new_alerts() -> None:
     await engine.on_bar(BEARISH_BAR_13)
     assert await engine.on_bar(ENGULFING_BAR_14) == []
     assert engine._position is None
+
+
+# --- Phase 3: gateway routing, slippage, open positions, data-disconnect gating
+
+
+@pytest.mark.asyncio
+async def test_slipping_gateway_slippage_is_recorded_on_the_trade() -> None:
+    """With a slippage-only gateway (no variance bounds collapse: min == max),
+    the persisted trade must carry the requested/actual price pair and a
+    positive combined slippage cost."""
+    import random
+
+    persistence = FakePersistence()
+    gateway = MockExecutionGateway(
+        min_slippage_pct=0.001,
+        max_slippage_pct=0.001,
+        latency_range_ms=(0.0, 0.0),
+        rng=random.Random(7),
+    )
+    engine = MomentumEngine("MOCK", persistence=persistence, gateway=gateway)
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+    entry = (await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106)))[0]
+    assert entry.price > 106  # BUY fills adversely higher than requested
+    assert entry.metadata["requested_price"] == 106
+    assert entry.metadata["slippage_cost"] > 0
+
+    exit_signals = await engine.on_bar(make_1m_bar(6, 108.0, 108.5, 107.8, 108.2))
+    assert exit_signals[0].action is SignalAction.EXIT
+
+    trade = persistence.trades[0]
+    assert trade.requested_price == 106
+    assert trade.actual_filled_price == pytest.approx(entry.price)
+    assert trade.actual_filled_price > trade.requested_price
+    assert trade.slippage_cost > 0  # entry + exit degradation, in dollars
+
+
+@pytest.mark.asyncio
+async def test_momentum_open_position_is_persisted_and_cleared() -> None:
+    persistence = FakePersistence()
+    engine = MomentumEngine("MOCK", persistence=persistence, gateway=zero_slip_gateway())
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+    await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))  # entry
+
+    assert len(persistence.open_positions) == 1
+    open_position = persistence.open_positions[0]
+    assert open_position.engine_type == "momentum"
+    assert open_position.side == "long"
+    assert open_position.entry_order_id  # gateway order id captured for reconciliation
+
+    await engine.on_bar(make_1m_bar(6, 106.5, 106.8, 106.4, 106.6))  # exit
+    assert persistence.open_positions == []
+    assert persistence.cleared_positions == [("momentum", "MOCK")]
+
+
+@pytest.mark.asyncio
+async def test_swing_open_position_is_persisted_and_cleared() -> None:
+    persistence = FakePersistence()
+    engine = SwingEngine(
+        "MOCK", pivot_window=2, hold_period_bars=3, persistence=persistence, gateway=zero_slip_gateway()
+    )
+    for i in range(13):
+        await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
+    await engine.on_bar(BEARISH_BAR_13)
+    await engine.on_bar(ENGULFING_BAR_14)  # entry
+
+    assert len(persistence.open_positions) == 1
+    assert persistence.open_positions[0].engine_type == "swing"
+    assert persistence.open_positions[0].side == "long"
+
+    await engine.on_bar(make_4h_bar(15, 15.0, 15.2, 14.8, 15.0))
+    await engine.on_bar(make_4h_bar(16, 15.0, 15.3, 14.9, 15.1))
+    await engine.on_bar(make_4h_bar(17, 15.1, 15.6, 15.0, 15.5))  # hold period elapses -> closes
+    assert persistence.open_positions == []
+
+
+@pytest.mark.asyncio
+async def test_momentum_data_disconnected_freezes_evaluation() -> None:
+    """While the ticker is marked DATA_DISCONNECTED the engine must not trade —
+    and must not force-close its open position on potentially-bogus bars."""
+    risk_manager = RiskManager()
+    engine = MomentumEngine("MOCK", risk_manager=risk_manager, gateway=zero_slip_gateway())
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+    await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106))  # opens a BUY position
+    assert engine._position is not None
+
+    risk_manager.mark_data_disconnected("MOCK")
+    # A bar that would otherwise hit the profit target is ignored entirely.
+    assert await engine.on_bar(make_1m_bar(6, 120.0, 121.0, 119.0, 120.0)) == []
+    assert engine._position is not None  # still open: no evaluation happened
+
+    risk_manager.mark_data_verified("MOCK")
+    signals = await engine.on_bar(make_1m_bar(7, 106.6, 106.9, 106.5, 106.6))
+    assert signals and signals[0].action is SignalAction.EXIT  # normal operation resumes
+
+
+@pytest.mark.asyncio
+async def test_swing_data_disconnected_freezes_evaluation_and_buffering() -> None:
+    risk_manager = RiskManager()
+    engine = SwingEngine("MOCK", pivot_window=2, risk_manager=risk_manager, gateway=zero_slip_gateway())
+    for i in range(13):
+        await engine.on_bar(_neutral_bar(i, COLLINEAR_LOWS[i]))
+    await engine.on_bar(BEARISH_BAR_13)
+
+    risk_manager.mark_data_disconnected("MOCK")
+    bars_before = len(engine._bars)
+    assert await engine.on_bar(ENGULFING_BAR_14) == []  # would have alerted
+    assert len(engine._bars) == bars_before  # unverified bar not even buffered
+
+    risk_manager.mark_data_verified("MOCK")
+    signals = await engine.on_bar(ENGULFING_BAR_14)
+    assert len(signals) == 1
+    assert signals[0].action is SignalAction.ALERT
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_books_position_at_filled_size() -> None:
+    """An order bigger than the simulated book depth partially fills; the engine
+    must track the actually-filled notional, not what it asked for."""
+    risk_manager = RiskManager(total_capital=2_000_000.0, allocation_pct={"momentum": 0.05, "swing": 0.15})
+    gateway = zero_slip_gateway()  # book_depth_notional=50_000, partial_fill_ratio=0.9
+    engine = MomentumEngine("MOCK", risk_manager=risk_manager, gateway=gateway)
+    for bar in OPENING_RANGE_BARS:
+        await engine.on_bar(bar)
+
+    signal = (await engine.on_bar(make_1m_bar(5, 102, 107, 102, 106)))[0]
+    requested = 2_000_000.0 * 0.05  # 100k > 50k depth
+    assert signal.metadata["order_status"] == "partially_filled"
+    assert signal.metadata["position_size"] == pytest.approx(requested * 0.9)
+    assert engine._position is not None
+    assert engine._position.notional == pytest.approx(requested * 0.9)

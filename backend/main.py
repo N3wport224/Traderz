@@ -30,19 +30,36 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import ConfigStore, ConfigValidationError
-from backend.data_pipeline import stream_1m_bars, stream_4h_bars
+from backend.data_pipeline import (
+    MockOHLCVGenerator,
+    ResilientStream,
+    flaky_stream,
+    stream_1m_bars,
+    stream_4h_bars,
+)
 from backend.db import Database
-from backend.models import TradeSignal
+from backend.execution_gateway import LiveCCXTExecutionGateway, MockExecutionGateway
+from backend.models import ExecutionGateway, OHLCVBar, TradeSignal
 from backend.notifier import ConsoleNotifier, Notifier, WebhookNotifier
+from backend.reconciliation import reconcile_on_boot
 from backend.risk_manager import RiskManager
 from backend.schemas import MomentumConfigUpdate, SwingConfigUpdate
 from backend.strategies.momentum_engine import MomentumEngine
 from backend.strategies.swing_engine import SwingEngine
+from backend.telemetry import TelemetryTracker, configure_json_logging
 
 SYMBOL = "MOCK"
 MOMENTUM_TICK_SECONDS = 1.0
 SWING_TICK_SECONDS = 2.0
 MAX_SIGNALS_RETAINED = 500
+
+
+def _build_gateway() -> ExecutionGateway:
+    """Mock by default; set GATEWAY_MODE=live (+ API_KEY/API_SECRET, optional
+    EXCHANGE_ID) to route orders to a real exchange through CCXT."""
+    if os.environ.get("GATEWAY_MODE", "mock").lower() == "live":
+        return LiveCCXTExecutionGateway(exchange_id=os.environ.get("EXCHANGE_ID", "binance"))
+    return MockExecutionGateway()
 
 
 def _iso_utc(timestamp: datetime) -> str:
@@ -117,13 +134,29 @@ def create_app(
     *,
     momentum_interval_seconds: float = MOMENTUM_TICK_SECONDS,
     swing_interval_seconds: float = SWING_TICK_SECONDS,
+    gateway: ExecutionGateway | None = None,
+    json_log_path: str | None = None,
+    simulate_disconnect_after: int | None = None,
+    backoff_scale: float = 1.0,
 ) -> FastAPI:
+    """Composition root.
+
+    `gateway` overrides the env-driven default (tests inject a seeded mock).
+    `simulate_disconnect_after` makes each mock stream drop after that many
+    bars — a live demo of the reconnection state machine; `backoff_scale`
+    shrinks its real-time delays for tests. `json_log_path` overrides the
+    structured-log destination (env: LOG_JSON_PATH, default `logging.json`).
+    """
     database = Database(database_url)
     config_store = ConfigStore()
     risk_manager = RiskManager()
     notifier = _build_notifier()
+    telemetry = TelemetryTracker()
+    execution_gateway = gateway if gateway is not None else _build_gateway()
     momentum_state = EngineState()
     swing_state = EngineState()
+    resilient_streams: dict[str, ResilientStream] = {}
+    boot_report: dict[str, Any] = {}
 
     async def _run_engine_worker(engine: MomentumEngine | SwingEngine, bar_stream: Any, state: EngineState) -> None:
         async for signal in engine.run(bar_stream):
@@ -131,9 +164,26 @@ def create_app(
             await state.connections.broadcast(payload)
             await notifier.notify_signal(signal)
 
+    def _resilient(name: str, factory: Any) -> ResilientStream:
+        stream = ResilientStream(
+            factory,
+            SYMBOL,
+            risk_manager=risk_manager,
+            notifier=notifier,
+            backoff_scale=backoff_scale,
+        )
+        resilient_streams[name] = stream
+        return stream
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        configure_json_logging(json_log_path or os.environ.get("LOG_JSON_PATH", "logging.json"))
         await database.init()
+
+        # Crash recovery: diff the gateway's open orders against our persisted
+        # open positions and self-heal before any engine places a new order.
+        report = await reconcile_on_boot(execution_gateway, database)
+        boot_report.update(report.as_dict())
 
         momentum_starting_equity = await database.get_latest_equity(MomentumEngine.ENGINE_TYPE)
         swing_starting_equity = await database.get_latest_equity(SwingEngine.ENGINE_TYPE)
@@ -143,6 +193,8 @@ def create_app(
             config_store=config_store,
             risk_manager=risk_manager,
             persistence=database,
+            gateway=execution_gateway,
+            telemetry=telemetry,
             starting_equity=momentum_starting_equity,
         )
         swing_engine = SwingEngine(
@@ -150,16 +202,37 @@ def create_app(
             config_store=config_store,
             risk_manager=risk_manager,
             persistence=database,
+            gateway=execution_gateway,
+            telemetry=telemetry,
             starting_equity=swing_starting_equity,
         )
 
+        # Each engine keeps one generator across reconnects so the simulated
+        # price walk continues instead of restarting on every new connection.
+        momentum_generator = MockOHLCVGenerator(SYMBOL)
+        swing_generator = MockOHLCVGenerator(SYMBOL)
+
+        def momentum_stream_factory() -> AsyncIterator[OHLCVBar]:
+            base = stream_1m_bars(
+                SYMBOL, interval_seconds=momentum_interval_seconds, generator=momentum_generator
+            )
+            if simulate_disconnect_after is not None:
+                return flaky_stream(base, drop_after=[simulate_disconnect_after])
+            return base
+
+        def swing_stream_factory() -> AsyncIterator[OHLCVBar]:
+            base = stream_4h_bars(SYMBOL, interval_seconds=swing_interval_seconds, generator=swing_generator)
+            if simulate_disconnect_after is not None:
+                return flaky_stream(base, drop_after=[simulate_disconnect_after])
+            return base
+
         momentum_task = asyncio.create_task(
             _run_engine_worker(
-                momentum_engine, stream_1m_bars(SYMBOL, interval_seconds=momentum_interval_seconds), momentum_state
+                momentum_engine, _resilient("momentum", momentum_stream_factory).bars(), momentum_state
             )
         )
         swing_task = asyncio.create_task(
-            _run_engine_worker(swing_engine, stream_4h_bars(SYMBOL, interval_seconds=swing_interval_seconds), swing_state)
+            _run_engine_worker(swing_engine, _resilient("swing", swing_stream_factory).bars(), swing_state)
         )
         try:
             yield
@@ -238,6 +311,28 @@ def create_app(
     async def risk_status() -> dict[str, Any]:
         return risk_manager.status()
 
+    @app.get("/api/telemetry")
+    async def telemetry_stats() -> dict[str, Any]:
+        stats = telemetry.stats()
+        stats["persisted_slippage_cost"] = await database.total_slippage_cost()
+        stats["gateway"] = {
+            "name": execution_gateway.name,
+            "mode": "mock" if isinstance(execution_gateway, MockExecutionGateway) else "live",
+        }
+        stats["system_status"] = risk_manager.system_status()
+        stats["data_disconnected"] = risk_manager.is_data_disconnected()
+        stats["disconnected_tickers"] = risk_manager.disconnected_tickers
+        stats["streams"] = {
+            name: {
+                "state": stream.state.value,
+                "disconnect_count": stream.disconnect_count,
+                "reconnect_attempts": stream.reconnect_attempts,
+            }
+            for name, stream in resilient_streams.items()
+        }
+        stats["boot_reconciliation"] = dict(boot_report)
+        return stats
+
     @app.post("/api/system/pause")
     async def pause_system() -> dict[str, Any]:
         risk_manager.pause()
@@ -281,6 +376,9 @@ def _trade_to_json(trade: Any) -> dict[str, Any]:
         "position_size": trade.position_size,
         "fees": trade.fees,
         "net_profit": trade.net_profit,
+        "requested_price": trade.requested_price,
+        "actual_filled_price": trade.actual_filled_price,
+        "slippage_cost": trade.slippage_cost,
     }
 
 

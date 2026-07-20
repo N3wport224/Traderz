@@ -8,6 +8,7 @@ database, so nothing leaks between tests (no shared module-level singletons).
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -136,8 +137,8 @@ def test_momentum_pipeline_persists_trades_and_equity_reachable_via_api() -> Non
         # `record_trade` and `record_equity_snapshot` are two separate awaited DB
         # writes, not one atomic transaction, so poll for both rather than assuming
         # one being visible implies the other already is too.
-        trades: list[object] = []
-        equity: list[object] = []
+        trades: list[dict[str, Any]] = []
+        equity: list[dict[str, Any]] = []
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and not (trades and equity):
             time.sleep(0.1)
@@ -160,7 +161,14 @@ def test_momentum_pipeline_persists_trades_and_equity_reachable_via_api() -> Non
             "position_size",
             "fees",
             "net_profit",
+            "requested_price",
+            "actual_filled_price",
+            "slippage_cost",
         }
+        # gateway slippage is baked into every fill: requested != actual
+        assert trade["requested_price"] > 0
+        assert trade["actual_filled_price"] != trade["requested_price"]
+        assert trade["slippage_cost"] > 0
 
         assert equity[0]["timestamp"].endswith("+00:00") or equity[0]["timestamp"].endswith("Z")
 
@@ -169,3 +177,85 @@ def test_momentum_pipeline_persists_trades_and_equity_reachable_via_api() -> Non
         # breaks out — either is a valid entry, so accept both.
         assert any(s["action"] in ("buy", "short") for s in signals)
         assert any(s["action"] == "exit" for s in signals)
+
+
+# --- Phase 3: telemetry endpoint, boot reconciliation, disconnect status ------
+
+
+def test_telemetry_endpoint_reports_gateway_latency_and_slippage() -> None:
+    app = create_app("sqlite+aiosqlite:///:memory:", momentum_interval_seconds=0.02, swing_interval_seconds=0.02)
+    with TestClient(app) as client:
+        telemetry: dict[str, Any] = {}
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not telemetry.get("order_count"):
+            time.sleep(0.1)
+            telemetry = client.get("/api/telemetry").json()
+
+        assert telemetry["order_count"] >= 1, "expected at least one order flow within the deadline"
+        assert telemetry["gateway"] == {"name": "MOCK", "mode": "mock"}
+        assert telemetry["connection_latency_ms"] > 0
+        assert telemetry["cumulative_slippage_cost"] > 0
+        assert telemetry["avg_gateway_latency_ms"] > 0
+        assert telemetry["system_status"] == "RUNNING"
+        assert telemetry["data_disconnected"] is False
+        assert telemetry["streams"]["momentum"]["state"] == "connected"
+        assert telemetry["streams"]["swing"]["state"] == "connected"
+        assert telemetry["boot_reconciliation"]["discrepancies"] == 0
+
+        flow = telemetry["last_flow"]
+        assert flow["signal_to_fill_ms"] >= flow["approval_to_fill_ms"]
+        assert flow["requested_price"] != flow["filled_price"]
+
+
+def test_boot_reconciliation_heals_gateway_orders_missing_from_db() -> None:
+    """Simulates a crash between fill and DB write: the injected gateway already
+    holds an open order when the app boots, so lifespan reconciliation must
+    insert the missing open-position row and report it via /api/telemetry."""
+    import asyncio
+    import random
+
+    from backend.execution_gateway import MockExecutionGateway
+    from backend.models import SignalAction
+
+    gateway = MockExecutionGateway(latency_range_ms=(0.0, 0.5), rng=random.Random(2))
+    orphan = asyncio.run(gateway.execute_order(SignalAction.BUY, 1_000.0, "MOCK", 100.0))
+
+    app = create_app(
+        "sqlite+aiosqlite:///:memory:",
+        gateway=gateway,
+        momentum_interval_seconds=0.5,
+        swing_interval_seconds=0.5,
+    )
+    with TestClient(app) as client:
+        telemetry = client.get("/api/telemetry").json()
+        assert telemetry["boot_reconciliation"]["healed"] == [orphan.order_id]
+        assert telemetry["boot_reconciliation"]["cleared"] == []
+
+
+def test_simulated_stream_drop_surfaces_data_disconnected_status() -> None:
+    """With simulate_disconnect_after, both mock streams drop shortly after
+    boot; while the reconnection state machine is backing off, /api/telemetry
+    (and /api/risk/status) must expose DATA_DISCONNECTED — this is what drives
+    the frontend's alert banner."""
+    app = create_app(
+        "sqlite+aiosqlite:///:memory:",
+        momentum_interval_seconds=0.02,
+        swing_interval_seconds=0.02,
+        simulate_disconnect_after=2,
+        backoff_scale=1.0,  # real 2s first delay -> a wide observable window
+    )
+    with TestClient(app) as client:
+        observed_disconnected = False
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and not observed_disconnected:
+            telemetry = client.get("/api/telemetry").json()
+            observed_disconnected = (
+                telemetry["data_disconnected"] and telemetry["system_status"] == "DATA_DISCONNECTED"
+            )
+            time.sleep(0.05)
+
+        assert observed_disconnected, "expected DATA_DISCONNECTED to surface during the outage"
+        telemetry = client.get("/api/telemetry").json()
+        streams = telemetry["streams"]
+        assert streams["momentum"]["disconnect_count"] >= 1 or streams["swing"]["disconnect_count"] >= 1
+        assert client.get("/api/risk/status").json()["system_status"] == "DATA_DISCONNECTED"

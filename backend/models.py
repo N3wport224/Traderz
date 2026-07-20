@@ -150,6 +150,25 @@ class ExecutionGateway(Protocol):
     async def fetch_open_orders(self, ticker: str | None = None) -> list[OrderFill]: ...
 
 
+class OrderFlowTelemetry(Protocol):
+    """Latency-tracking interface an engine reports each order flow through.
+
+    Measures the signal-generation -> risk-approval -> gateway-fill pipeline in
+    milliseconds. Synchronous by design: implementations must only aggregate
+    in memory / emit a log line, never block. Engines receive this injected
+    (like every other collaborator) and may be given `None` to disable it.
+    """
+
+    def record_order_flow(
+        self,
+        engine_type: str,
+        ticker: str,
+        signal_to_approval_ms: float,
+        approval_to_fill_ms: float,
+        fill: OrderFill,
+    ) -> None: ...
+
+
 class TradePersistence(Protocol):
     """Storage interface a strategy engine writes completed trades and equity marks
     through. Concrete implementations (e.g. `backend.db.DatabasePersistence`) are

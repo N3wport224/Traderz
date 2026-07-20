@@ -7,14 +7,18 @@ both live-configurable), and alerts when price retraces to within tolerance
 of a valid trendline alongside a bullish engulfing candle. Position size is
 capped by the shared `RiskManager`'s capital allocation limit for this
 engine, and every closed (hypothetical) trade is written through the
-injected `TradePersistence`. The engine depends only on `backend/models.py`
-(for the injected protocol) plus the standalone `backend/config.py` /
-`backend/risk_manager.py` collaborators — never on `backend/db.py`,
-`backend/main.py`, or the momentum engine.
+injected `TradePersistence`. Orders are never self-filled: every entry and
+exit routes through the injected `ExecutionGateway`, and PnL is booked against
+the actual (post-slippage) fill prices it returns. The engine depends only on
+`backend/models.py` (for the injected protocols) plus the standalone
+`backend/config.py` / `backend/risk_manager.py` / `backend/execution_gateway.py`
+collaborators — never on `backend/db.py`, `backend/main.py`, or the momentum
+engine.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,7 +27,19 @@ from itertools import combinations
 import pandas as pd
 
 from backend.config import ConfigStore
-from backend.models import NullPersistence, OHLCVBar, SignalAction, TradePersistence, TradeRecord, TradeSignal
+from backend.execution_gateway import MockExecutionGateway
+from backend.models import (
+    ExecutionGateway,
+    NullPersistence,
+    OHLCVBar,
+    OpenPositionRecord,
+    OrderFill,
+    OrderFlowTelemetry,
+    SignalAction,
+    TradePersistence,
+    TradeRecord,
+    TradeSignal,
+)
 from backend.risk_manager import RiskManager
 
 PIVOT_WINDOW = 5  # bars on each side required to confirm a pivot; not live-configurable
@@ -33,10 +49,14 @@ MAX_BAR_HISTORY = 200  # bounds the rolling buffer so pivot/trendline recomputat
 
 @dataclass(slots=True)
 class _OpenPosition:
-    entry_price: float
+    entry_price: float  # actual gateway fill price (post-slippage)
     entry_bar_count: int
     entry_timestamp: datetime
-    notional: float
+    notional: float  # actually-filled notional (may be < requested on partial fill)
+    requested_entry_price: float
+    entry_fees: float
+    entry_slippage_cost: float
+    entry_order_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +95,8 @@ class SwingEngine:
         config_store: ConfigStore | None = None,
         risk_manager: RiskManager | None = None,
         persistence: TradePersistence | None = None,
+        gateway: ExecutionGateway | None = None,
+        telemetry: OrderFlowTelemetry | None = None,
         starting_equity: float = 0.0,
     ) -> None:
         self.symbol = symbol
@@ -84,6 +106,8 @@ class SwingEngine:
         self._config_store = config_store or ConfigStore()
         self._risk_manager = risk_manager or RiskManager()
         self._persistence = persistence or NullPersistence()
+        self._gateway: ExecutionGateway = gateway or MockExecutionGateway()
+        self._telemetry = telemetry
 
         self._bars: list[OHLCVBar] = []
         self._bar_count: int = 0
@@ -202,19 +226,56 @@ class SwingEngine:
         self.signals.append(signal)
         return signal
 
+    async def _route_order(
+        self,
+        action: SignalAction,
+        notional: float,
+        bar: OHLCVBar,
+        signal_started: float,
+        approved_at: float,
+    ) -> OrderFill:
+        """Sends the order through the gateway and reports pipeline latency."""
+        fill = await self._gateway.execute_order(action, notional, self.symbol, bar.close)
+        filled_at = time.perf_counter()
+        if self._telemetry is not None:
+            self._telemetry.record_order_flow(
+                self.ENGINE_TYPE,
+                self.symbol,
+                (approved_at - signal_started) * 1000.0,
+                (filled_at - approved_at) * 1000.0,
+                fill,
+            )
+        return fill
+
     async def _close_position(self, bar: OHLCVBar, reason: str) -> list[TradeSignal]:
         position = self._position
         assert position is not None
-        pct_move = (bar.close - position.entry_price) / position.entry_price
+        signal_started = time.perf_counter()
+        # Exits are always allowed — approval is instantaneous by design.
+        fill = await self._route_order(SignalAction.SELL, position.notional, bar, signal_started, signal_started)
+
+        pct_move = (fill.filled_price - position.entry_price) / position.entry_price
         gross_pnl = pct_move * position.notional
-        fees = self._risk_manager.compute_fees(position.notional)
+        fees = position.entry_fees + fill.fees
         net_pnl = gross_pnl - fees
+        slippage_cost = position.entry_slippage_cost + fill.slippage_cost
 
         self.equity += net_pnl
         self.equity_curve.append((bar.timestamp, self.equity))
         self._position = None
 
-        signals = [self._emit(SignalAction.EXIT, bar.close, bar.timestamp, reason, pnl=round(net_pnl, 4), fees=round(fees, 4))]
+        signals = [
+            self._emit(
+                SignalAction.EXIT,
+                fill.filled_price,
+                bar.timestamp,
+                reason,
+                pnl=round(net_pnl, 4),
+                fees=round(fees, 4),
+                slippage_cost=round(slippage_cost, 4),
+                order_id=fill.order_id,
+            )
+        ]
 
         await self._persistence.record_trade(
             TradeRecord(
@@ -223,17 +284,21 @@ class SwingEngine:
                 entry_timestamp=position.entry_timestamp,
                 exit_timestamp=bar.timestamp,
                 entry_price=position.entry_price,
-                exit_price=bar.close,
+                exit_price=fill.filled_price,
                 position_size=position.notional,
                 fees=fees,
                 net_profit=net_pnl,
+                requested_price=position.requested_entry_price,
+                actual_filled_price=position.entry_price,
+                slippage_cost=slippage_cost,
             )
         )
         await self._persistence.record_equity_snapshot(self.ENGINE_TYPE, bar.timestamp, self.equity)
+        await self._persistence.clear_open_position(self.ENGINE_TYPE, self.symbol)
 
         if self._risk_manager.record_realized_pnl(self.ENGINE_TYPE, net_pnl, bar.timestamp):
             signals.append(
-                self._emit(SignalAction.CIRCUIT_BREAKER, bar.close, bar.timestamp, "max_daily_drawdown_exceeded")
+                self._emit(SignalAction.CIRCUIT_BREAKER, fill.filled_price, bar.timestamp, "max_daily_drawdown_exceeded")
             )
         return signals
 
@@ -244,6 +309,11 @@ class SwingEngine:
         tracking); it is marked to market and closed automatically after a fixed
         holding period so the strategy's equity curve stays bounded and observable.
         """
+        if self._risk_manager.is_data_disconnected(self.symbol):
+            # The ticker's stream is down/unverified: freeze — don't evaluate,
+            # don't even buffer bars whose integrity is in question.
+            return []
+
         self._bars.append(bar)
         self._bar_count += 1
         if len(self._bars) > self.max_bar_history:
@@ -288,20 +358,49 @@ class SwingEngine:
         if line_key in self._alerted_lines:
             return []
         self._alerted_lines.add(line_key)
-        notional = self._risk_manager.position_size(self.ENGINE_TYPE)
+
+        signal_started = time.perf_counter()
+        notional = self._risk_manager.position_size(self.ENGINE_TYPE)  # risk approval: allocation cap
+        approved_at = time.perf_counter()
+        fill = await self._route_order(SignalAction.BUY, notional, bar, signal_started, approved_at)
+
         self._position = _OpenPosition(
-            entry_price=bar.close, entry_bar_count=self._bar_count, entry_timestamp=bar.timestamp, notional=notional
+            entry_price=fill.filled_price,
+            entry_bar_count=self._bar_count,
+            entry_timestamp=bar.timestamp,
+            notional=fill.filled_size,
+            requested_entry_price=fill.requested_price,
+            entry_fees=fill.fees,
+            entry_slippage_cost=fill.slippage_cost,
+            entry_order_id=fill.order_id,
+        )
+        await self._persistence.record_open_position(
+            OpenPositionRecord(
+                engine_type=self.ENGINE_TYPE,
+                asset_ticker=self.symbol,
+                side="long",
+                entry_timestamp=bar.timestamp,
+                entry_price=fill.filled_price,
+                requested_entry_price=fill.requested_price,
+                position_size=fill.filled_size,
+                entry_fees=fill.fees,
+                entry_order_id=fill.order_id,
+            )
         )
 
         return [
             self._emit(
                 SignalAction.ALERT,
-                bar.close,
+                fill.filled_price,
                 bar.timestamp,
                 "trendline_retest_bullish_engulfing",
                 trendline_slope=line.slope,
                 trendline_touches=line.touches,
-                position_size=notional,
+                position_size=fill.filled_size,
+                requested_price=fill.requested_price,
+                slippage_cost=fill.slippage_cost,
+                order_id=fill.order_id,
+                order_status=fill.status.value,
             )
         ]
 

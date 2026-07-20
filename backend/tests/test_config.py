@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from backend.config import ConfigStore, ConfigValidationError, MomentumConfig, SwingConfig
@@ -65,7 +67,7 @@ async def test_update_momentum_rejects_invalid_values(kwargs: dict[str, int]) ->
         {"touch_tolerance_pct": 0.2},
     ],
 )
-async def test_update_swing_rejects_invalid_values(kwargs: dict[str, float]) -> None:
+async def test_update_swing_rejects_invalid_values(kwargs: dict[str, Any]) -> None:
     store = ConfigStore()
     with pytest.raises(ConfigValidationError):
         await store.update_swing(**kwargs)
