@@ -91,6 +91,25 @@ export interface RiskGuardStatus {
   current_date: string | null;
 }
 
+export interface RiskGuardSync {
+  persisted: boolean;
+  in_sync: boolean;
+  last_persisted_at?: string | null;
+  state_date?: string;
+  detail?: string;
+}
+
+export interface WebSocketHubStatus {
+  symbol: string;
+  state: StreamState;
+  disconnect_count: number;
+  frames_received: number;
+  bars_received: number;
+  dropped_bars: number;
+  subscribers: number;
+  last_latency_ms: number | null;
+}
+
 export interface RiskStatus {
   system_status: SystemStatus;
   halted: boolean;
@@ -106,6 +125,7 @@ export interface RiskStatus {
   fee_rate: number;
   current_date: string | null;
   risk_guard: RiskGuardStatus;
+  risk_guard_sync: RiskGuardSync;
 }
 
 export interface BacktestRequest {
@@ -183,6 +203,11 @@ export interface TelemetryStats {
   ticker: string;
   data_source_mode: DataSourceMode;
   risk_guard: RiskGuardStatus;
+  risk_guard_sync: RiskGuardSync;
+  database: { journal_mode: string };
+  transport: "rest" | "websocket";
+  websocket: WebSocketHubStatus | null;
+  stream_latency_ms: number | null;
   streams: Record<string, StreamStatus>;
   boot_reconciliation: {
     matched: string[];

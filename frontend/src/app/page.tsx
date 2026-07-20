@@ -104,6 +104,10 @@ export default function Dashboard() {
           <div className="flex flex-wrap items-center gap-3">
             <SystemHealth
               guard={guard}
+              sync={telemetry?.risk_guard_sync ?? risk.status?.risk_guard_sync ?? null}
+              dbMode={telemetry?.database?.journal_mode ?? null}
+              transport={telemetry?.transport ?? null}
+              streamLatencyMs={telemetry?.stream_latency_ms ?? null}
               onKill={risk.kill}
               onReset={risk.resetGuard}
               actionPending={risk.actionPending}
