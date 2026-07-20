@@ -44,6 +44,7 @@ from backend.models import (
 )
 from backend.risk_manager import RiskManager
 from backend.utils.indicators import nearest_resistance
+from backend.utils.risk_guard import RiskGuardTripped
 
 PIVOT_WINDOW = 5  # bars on each side required to confirm a pivot; not live-configurable
 HOLD_PERIOD_BARS = 3  # bars held after an alert, for equity/performance tracking
@@ -264,9 +265,11 @@ class SwingEngine:
         bar: OHLCVBar,
         signal_started: float,
         approved_at: float,
+        *,
+        is_exit: bool = False,
     ) -> OrderFill:
         """Sends the order through the gateway and reports pipeline latency."""
-        fill = await self._gateway.execute_order(action, notional, self.symbol, bar.close)
+        fill = await self._gateway.execute_order(action, notional, self.symbol, bar.close, is_exit=is_exit)
         filled_at = time.perf_counter()
         if self._telemetry is not None:
             self._telemetry.record_order_flow(
@@ -294,7 +297,9 @@ class SwingEngine:
             await self._gateway.cancel_bracket(position.entry_order_id)
             signal_started = time.perf_counter()
             # Exits are always allowed — approval is instantaneous by design.
-            fill = await self._route_order(SignalAction.SELL, position.notional, bar, signal_started, signal_started)
+            fill = await self._route_order(
+                SignalAction.SELL, position.notional, bar, signal_started, signal_started, is_exit=True
+            )
         else:
             fill = exit_fill  # the gateway's bracket monitor already executed it
 
@@ -445,7 +450,12 @@ class SwingEngine:
         signal_started = time.perf_counter()
         notional = self._risk_manager.position_size(self.ENGINE_TYPE)  # risk approval: allocation cap
         approved_at = time.perf_counter()
-        fill = await self._route_order(SignalAction.BUY, notional, bar, signal_started, approved_at)
+        try:
+            fill = await self._route_order(SignalAction.BUY, notional, bar, signal_started, approved_at)
+        except RiskGuardTripped:
+            # The operational risk guard rejected the entry (daily loss/trade
+            # cap or forced circuit breaker) — stand down, no position.
+            return []
 
         stop_loss, take_profit = self._bracket_levels(line.pivots, fill.filled_price)
         await self._gateway.register_bracket(

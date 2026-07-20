@@ -115,6 +115,22 @@ class RiskManager:
     def resume(self) -> None:
         self._paused = False
 
+    def halt(self, reason: str) -> None:
+        """External hard halt (Phase 6 risk guard trip / kill switch).
+
+        Sets the same halted state as a drawdown trip, so engines flatten any
+        open position on their very next bar through the existing
+        `circuit_breaker_active` force-close path and stop entering. Cleared by
+        the normal next-calendar-day roll or an operator resume/reset.
+        """
+        self._halted = True
+        self._halted_reason = reason
+
+    def clear_halt(self) -> None:
+        """Operator reset counterpart to `halt()` (guard reset endpoint)."""
+        self._halted = False
+        self._halted_reason = None
+
     def system_status(self, timestamp: datetime | None = None) -> str:
         if timestamp is not None:
             self._roll_day(timestamp)

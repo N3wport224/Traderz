@@ -477,3 +477,116 @@ def test_brackets_endpoint_reports_live_card_math() -> None:
 def test_brackets_endpoint_empty_when_no_positions() -> None:
     with new_client() as client:
         assert isinstance(client.get("/api/brackets").json(), list)
+
+
+# --- Phase 6: backtest endpoint, kill switch, guard status --------------------
+
+
+def test_backtest_endpoint_returns_metrics_and_is_reproducible() -> None:
+    payload = {
+        "symbol": "AAPL",
+        "strategy": "momentum",
+        "start_date": "2026-07-20T09:30:00+00:00",
+        "end_date": "2026-07-20T12:30:00+00:00",
+        "initial_capital": 100_000,
+    }
+    with new_client() as client:
+        first = client.post("/api/backtest", json=payload)
+        assert first.status_code == 200
+        body = first.json()
+        for key in (
+            "trade_count",
+            "net_pnl",
+            "total_return_pct",
+            "win_rate_pct",
+            "profit_factor",
+            "max_drawdown_pct",
+            "bars_replayed",
+            "equity_curve",
+            "bracket_outcomes",
+            "risk_guard",
+        ):
+            assert key in body, f"missing {key}"
+        assert body["bars_replayed"] > 0
+        assert body["max_drawdown_pct"] >= 0
+
+        second = client.post("/api/backtest", json=payload)
+        assert second.json()["net_pnl"] == body["net_pnl"]  # seeded by symbol+window
+
+
+def test_backtest_endpoint_validates_input() -> None:
+    with new_client() as client:
+        base = {
+            "symbol": "AAPL",
+            "strategy": "momentum",
+            "start_date": "2026-07-20",
+            "end_date": "2026-07-21",
+        }
+        assert client.post("/api/backtest", json={**base, "strategy": "scalper"}).status_code == 422
+        assert client.post("/api/backtest", json={**base, "symbol": "not a ticker!"}).status_code == 422
+        assert (
+            client.post("/api/backtest", json={**base, "start_date": "2026-07-22"}).status_code == 422
+        )  # end before start
+        assert client.post("/api/backtest", json={**base, "initial_capital": -5}).status_code == 422
+
+
+def test_backtest_endpoint_prefers_local_csv(tmp_path: Any, monkeypatch: Any) -> None:
+    """When BACKTEST_DATA_DIR holds a CSV for the symbol, it becomes the
+    historical source instead of the synthetic fallback."""
+    rows = ["timestamp,open,high,low,close,volume"]
+    base = "2026-07-20T09:{m:02d}:00+00:00"
+    prices = [
+        (100, 102, 98, 101), (101, 103, 99, 100), (100, 105, 95, 102),
+        (102, 104, 100, 101), (101, 103, 99, 100),
+    ]
+    for minute, (o, h, l, c) in enumerate(prices):
+        rows.append(f"{base.format(m=30 + minute)},{o},{h},{l},{c},1000")
+    price = 106.0
+    for minute in range(5, 60):
+        rows.append(f"{base.format(m=30 + minute) if minute < 30 else f'2026-07-20T10:{minute-30:02d}:00+00:00'},{price},{price + 16},{price - 1},{price + 2},1000")
+        price += 2
+    (tmp_path / "CSVTEST.csv").write_text("\n".join(rows) + "\n")
+    monkeypatch.setenv("BACKTEST_DATA_DIR", str(tmp_path))
+
+    with new_client() as client:
+        response = client.post(
+            "/api/backtest",
+            json={
+                "symbol": "CSVTEST",
+                "strategy": "momentum",
+                "start_date": "2026-07-20T09:30:00+00:00",
+                "end_date": "2026-07-20T11:00:00+00:00",
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["bars_replayed"] == 60  # exactly the CSV rows, not synthetic
+        assert body["trade_count"] >= 1
+        assert body["win_rate_pct"] == pytest.approx(100.0)  # the uptrend fixture
+
+
+def test_kill_switch_locks_guard_and_reset_releases_it() -> None:
+    with new_client() as client:
+        before = client.get("/api/risk/status").json()
+        assert before["risk_guard"]["locked"] is False
+
+        killed = client.post("/api/system/kill").json()
+        assert killed["risk_guard"]["locked"] is True
+        assert killed["risk_guard"]["circuit_breaker_active"] is True
+        assert killed["halted"] is True  # engines will flatten on their next bar
+
+        status = client.get("/api/telemetry").json()
+        assert status["risk_guard"]["locked"] is True
+
+        reset = client.post("/api/system/guard/reset").json()
+        assert reset["risk_guard"]["locked"] is False
+        assert reset["halted"] is False
+
+
+def test_risk_guard_env_limits_flow_into_status(monkeypatch: Any) -> None:
+    monkeypatch.setenv("MAX_DAILY_LOSS_PCT", "0.02")
+    monkeypatch.setenv("MAX_DAILY_TRADE_COUNT", "9")
+    with new_client() as client:
+        guard = client.get("/api/risk/status").json()["risk_guard"]
+        assert guard["max_daily_loss_pct"] == 0.02
+        assert guard["max_daily_trade_count"] == 9

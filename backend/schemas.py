@@ -33,3 +33,19 @@ class WatchlistUpdate(BaseModel):
                 "ticker must be a stock symbol (AAPL, BRK.B) or crypto pair (BTC/USDT)"
             )
         return normalized
+
+
+class BacktestRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=26)
+    strategy: str = Field(pattern="^(momentum|swing)$")
+    start_date: str  # ISO date or datetime
+    end_date: str
+    initial_capital: float = Field(default=100_000.0, gt=0, le=1e9)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not TICKER_PATTERN.fullmatch(normalized):
+            raise ValueError("symbol must be a stock ticker (AAPL) or crypto pair (BTC/USDT)")
+        return normalized

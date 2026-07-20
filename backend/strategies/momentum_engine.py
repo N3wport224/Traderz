@@ -41,6 +41,7 @@ from backend.models import (
 )
 from backend.risk_manager import RiskManager
 from backend.utils.indicators import compute_atr
+from backend.utils.risk_guard import RiskGuardTripped
 
 ATR_PERIOD = 14  # rolling window for the volatility estimate
 SL_ATR_MULTIPLE = 1.5  # stop loss sits 1.5x ATR against the entry
@@ -147,9 +148,11 @@ class MomentumEngine:
         bar: OHLCVBar,
         signal_started: float,
         approved_at: float,
+        *,
+        is_exit: bool = False,
     ) -> OrderFill:
         """Sends the order through the gateway and reports pipeline latency."""
-        fill = await self._gateway.execute_order(action, notional, self.symbol, bar.close)
+        fill = await self._gateway.execute_order(action, notional, self.symbol, bar.close, is_exit=is_exit)
         filled_at = time.perf_counter()
         if self._telemetry is not None:
             self._telemetry.record_order_flow(
@@ -175,13 +178,26 @@ class MomentumEngine:
         else:
             stop_loss = entry_price + self.sl_atr_multiple * atr
             take_profit = entry_price - self.tp_atr_multiple * atr
+        # Extreme volatility relative to a small price can push a level through
+        # zero (e.g. a short's TP after a crash) — clamp to a deep-but-valid
+        # 5% band so the bracket stays registrable rather than crashing.
+        floor = entry_price * 0.05
+        if action is SignalAction.BUY:
+            stop_loss = max(stop_loss, floor)
+        else:
+            take_profit = max(take_profit, floor)
         return atr, round(stop_loss, 6), round(take_profit, 6)
 
     async def _open_position(self, action: SignalAction, bar: OHLCVBar, reason: str) -> list[TradeSignal]:
         signal_started = time.perf_counter()
         notional = self._risk_manager.position_size(self.ENGINE_TYPE)  # risk approval: allocation cap
         approved_at = time.perf_counter()
-        fill = await self._route_order(action, notional, bar, signal_started, approved_at)
+        try:
+            fill = await self._route_order(action, notional, bar, signal_started, approved_at)
+        except RiskGuardTripped:
+            # The operational risk guard rejected the entry (daily loss/trade
+            # cap or forced circuit breaker) — stand down, no position.
+            return []
 
         atr, stop_loss, take_profit = self._bracket_levels(action, fill.filled_price)
         side = "long" if action is SignalAction.BUY else "short"
@@ -263,7 +279,9 @@ class MomentumEngine:
             signal_started = time.perf_counter()
             # Exits are always allowed — approval is instantaneous by design.
             exit_action = SignalAction.SELL if position.action is SignalAction.BUY else SignalAction.BUY
-            fill = await self._route_order(exit_action, position.notional, bar, signal_started, signal_started)
+            fill = await self._route_order(
+                exit_action, position.notional, bar, signal_started, signal_started, is_exit=True
+            )
         else:
             fill = exit_fill  # the gateway's bracket monitor already executed it
 

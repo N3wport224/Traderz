@@ -175,12 +175,18 @@ class TradeRecord:
 class ExecutionGateway(Protocol):
     """Order-routing interface injected into the strategy engines.
 
+    `risk_guard` is the Phase 6 operational guard slot (an
+    `backend.utils.risk_guard.RiskGuard` or None) — typed loosely here so this
+    shared module stays free of collaborator imports.
+
     Engines never simulate their own fills: every entry and exit goes through
     `execute_order`, and the returned `OrderFill` (post-slippage price, fees,
     partial-fill size) is the truth the engine books PnL against. Concrete
     implementations live in `backend/execution_gateway.py`; engines only ever
     see this protocol, keeping them unit-testable with fakes.
     """
+
+    risk_guard: Any
 
     @property
     def name(self) -> str: ...
@@ -191,6 +197,8 @@ class ExecutionGateway(Protocol):
         size: float,
         ticker: str,
         requested_price: float,
+        *,
+        is_exit: bool = False,
     ) -> OrderFill: ...
 
     async def fetch_open_orders(self, ticker: str | None = None) -> list[OrderFill]: ...

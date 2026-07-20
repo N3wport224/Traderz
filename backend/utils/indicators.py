@@ -55,7 +55,7 @@ def compute_atr(bars: Sequence[OHLCVBar], period: int = DEFAULT_ATR_PERIOD) -> f
     ranges = true_ranges(bars)
     if ranges.empty:
         return 0.0
-    atr = ranges.rolling(window=period, min_periods=1).mean()
+    atr = pd.Series(ranges.rolling(window=period, min_periods=1).mean())
     return float(atr.iloc[-1])
 
 

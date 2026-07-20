@@ -28,7 +28,20 @@ when both levels sit inside one candle; gap-throughs fill at the open) and execu
 the exit itself. Trades persist `stop_loss_price`/`take_profit_price`/`bracket_status`
 (ACTIVE/HIT_SL/HIT_TP/TIME_EXITED), `/api/brackets` serves live bracket cards, and
 the dashboard shows them in the Active Target Signals panel with distance-to-target
-and risk-reward readouts.
+and risk-reward readouts. Phase 6 adds `backend/engine/backtester.py` — an
+event-driven historical replay (`HistoricalTransport` from CSV/JSON/seeded
+synthetic) that feeds the *unmodified* live engines + gateway + bracket monitor and
+folds results into `BacktestResult` (total return %, win rate %, profit factor, max
+peak-to-trough drawdown %), exposed via `POST /api/backtest` — and
+`backend/utils/risk_guard.py`, an env-configured operational guard
+(`MAX_DAILY_LOSS_PCT`, `MAX_DAILY_TRADE_COUNT`, `CIRCUIT_BREAKER_ACTIVE`) enforced
+inside the gateway in front of every ENTRY (exits always pass; a trip halts the
+`RiskManager` so engines flatten on the next bar). Orders now carry an `is_exit`
+flag so short covers match the broker-side book instead of registering as entries;
+the gateway books round-trip realized PnL into the guard from its own fill stream.
+`POST /api/system/kill` is the emergency kill switch; `/api/system/guard/reset`
+releases it; the dashboard has a Strategy Analytics & Backtesting tab and a
+flashing RISK GUARD TRIPPED header badge.
 
 ## Architecture
 

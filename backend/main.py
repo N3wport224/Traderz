@@ -38,12 +38,14 @@ from backend.data_pipeline import (
     resolve_data_source_mode,
 )
 from backend.db import Database
+from backend.engine.backtester import BacktestError, HistoricalTransport, run_backtest
 from backend.execution_gateway import LiveCCXTExecutionGateway, MockExecutionGateway
 from backend.models import ExecutionGateway, OHLCVBar, Timeframe, TradeSignal
 from backend.notifier import ConsoleNotifier, Notifier, WebhookNotifier
 from backend.reconciliation import reconcile_on_boot
 from backend.risk_manager import RiskManager
-from backend.schemas import MomentumConfigUpdate, SwingConfigUpdate, WatchlistUpdate
+from backend.schemas import BacktestRequest, MomentumConfigUpdate, SwingConfigUpdate, WatchlistUpdate
+from backend.utils.risk_guard import RiskGuard
 from backend.strategies.momentum_engine import MomentumEngine
 from backend.strategies.swing_engine import SwingEngine
 from backend.telemetry import TelemetryTracker, configure_json_logging
@@ -167,6 +169,14 @@ def create_app(
     notifier = _build_notifier()
     telemetry = TelemetryTracker()
     execution_gateway = gateway if gateway is not None else _build_gateway()
+    # Operational risk guard (Phase 6): env-configured limits in front of every
+    # entry. A trip halts the risk manager so engines flatten on their next bar.
+    risk_guard = RiskGuard.from_env(
+        risk_manager.total_capital,
+        on_trip=lambda reason: risk_manager.halt(f"risk_guard: {reason}"),
+    )
+    if execution_gateway.risk_guard is None:
+        execution_gateway.risk_guard = risk_guard
     source_mode = resolve_data_source_mode(data_source_mode)
     momentum_state = EngineState()
     swing_state = EngineState()
@@ -418,7 +428,90 @@ def create_app(
 
     @app.get("/api/risk/status")
     async def risk_status() -> dict[str, Any]:
-        return risk_manager.status()
+        status = risk_manager.status()
+        status["risk_guard"] = risk_guard.status()
+        return status
+
+    @app.post("/api/system/kill")
+    async def kill_switch() -> dict[str, Any]:
+        """Emergency kill switch: forces the circuit breaker and halts the risk
+        manager, so engines flatten any open position on their very next bar
+        and every subsequent entry is rejected at the execution gateway."""
+        risk_guard.force_circuit_breaker(True)
+        risk_manager.halt("risk_guard: circuit_breaker_forced")
+        logger.warning("EMERGENCY KILL SWITCH ENGAGED", extra={"event": "kill_switch"})
+        status = risk_manager.status()
+        status["risk_guard"] = risk_guard.status()
+        return status
+
+    @app.post("/api/system/guard/reset")
+    async def guard_reset() -> dict[str, Any]:
+        """Operator reset: releases the manual breaker, clears daily counters,
+        and lifts the halt so trading can resume."""
+        risk_guard.reset()
+        risk_manager.clear_halt()
+        logger.info("risk guard reset via API", extra={"event": "risk_guard_reset"})
+        status = risk_manager.status()
+        status["risk_guard"] = risk_guard.status()
+        return status
+
+    @app.post("/api/backtest")
+    async def backtest(request: BacktestRequest) -> dict[str, Any]:
+        """Replays the requested window through the exact live strategy stack.
+
+        Data source: a local CSV at `BACKTEST_DATA_DIR/{symbol}.csv` when one
+        exists, otherwise a deterministic seeded synthetic history (seeded by
+        symbol + window, so identical requests return identical results).
+        """
+        try:
+            start_time = datetime.fromisoformat(request.start_date.replace("Z", "+00:00"))
+            end_time = datetime.fromisoformat(request.end_date.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"unparseable date: {exc}") from exc
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        if end_time <= start_time:
+            raise HTTPException(status_code=422, detail="end_date must be after start_date")
+
+        timeframe = Timeframe.ONE_MINUTE if request.strategy == "momentum" else Timeframe.FOUR_HOUR
+        data_dir = os.environ.get("BACKTEST_DATA_DIR", "data")
+        csv_path = os.path.join(data_dir, f"{request.symbol.replace('/', '_')}.csv")
+        try:
+            if os.path.exists(csv_path):
+                transport = HistoricalTransport.from_csv(csv_path, request.symbol, timeframe)
+            else:
+                seed = abs(hash((request.symbol, request.start_date, request.end_date))) % (2**32)
+                transport = HistoricalTransport.synthetic(
+                    request.symbol, timeframe, start_time, end_time, seed=seed
+                )
+            # Each backtest replays with its own fresh guard at the live env
+            # limits — a locked live guard must not leak into simulations.
+            replay_guard = RiskGuard.from_env(request.initial_capital)
+            result = await run_backtest(
+                request.strategy,
+                request.symbol,
+                start_time,
+                end_time,
+                transport,
+                initial_capital=request.initial_capital,
+                risk_guard=replay_guard,
+            )
+        except BacktestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload = result.as_dict()
+        logger.info(
+            "backtest complete",
+            extra={
+                "event": "backtest_complete",
+                "strategy": request.strategy,
+                "symbol": request.symbol,
+                "trade_count": payload["trade_count"],
+                "total_return_pct": payload["total_return_pct"],
+            },
+        )
+        return payload
 
     @app.get("/api/telemetry")
     async def telemetry_stats() -> dict[str, Any]:
@@ -433,6 +526,7 @@ def create_app(
         stats["disconnected_tickers"] = risk_manager.disconnected_tickers
         stats["ticker"] = watch["symbol"]
         stats["data_source_mode"] = source_mode
+        stats["risk_guard"] = risk_guard.status()
         stats["streams"] = {
             name: {
                 "state": stream.state.value,

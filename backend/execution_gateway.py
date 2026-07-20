@@ -34,6 +34,7 @@ from backend.models import (
     OrderStatus,
     SignalAction,
 )
+from backend.utils.risk_guard import RiskGuard
 
 # Which way an adverse fill moves the price for each order side. Closing a
 # short is a market BUY, closing a long is a market SELL — engines pass the
@@ -68,6 +69,10 @@ class BaseExecutionGateway(ABC):
     def __init__(self) -> None:
         self._brackets: dict[str, BracketOrder] = {}
         self._last_prices: dict[str, float] = {}
+        # Operational risk guard (Phase 6): when attached, every ENTRY order is
+        # validated against it before filling; exits always pass so the system
+        # can flatten. Wired by the composition root / backtester.
+        self.risk_guard: RiskGuard | None = None
 
     @property
     @abstractmethod
@@ -81,12 +86,27 @@ class BaseExecutionGateway(ABC):
         size: float,
         ticker: str,
         requested_price: float,
+        *,
+        is_exit: bool = False,
     ) -> OrderFill:
         """Route a market order for `size` notional dollars of `ticker`.
 
         `requested_price` is the price the engine decided at (its bar close);
         the returned fill carries the post-slippage price actually obtained.
+        `is_exit` marks orders that unwind an existing position (a long close's
+        SELL or a short cover's BUY): they bypass the risk guard and are matched
+        against the broker-side open order book instead of extending it.
         """
+
+    def enforce_risk_guard(self, signal_type: SignalAction, is_exit: bool) -> None:
+        """Entry gate: raises `RiskGuardTripped` when the guard rejects.
+
+        Called by every concrete gateway at the top of `execute_order`.
+        """
+        if self.risk_guard is None or is_exit:
+            return
+        if signal_type in (SignalAction.BUY, SignalAction.SHORT):
+            self.risk_guard.validate_entry()
 
     @abstractmethod
     async def fetch_open_orders(self, ticker: str | None = None) -> list[OrderFill]:
@@ -110,8 +130,11 @@ class BaseExecutionGateway(ABC):
     # --- bracket order monitor -------------------------------------------------
 
     def observe_bar(self, bar: OHLCVBar) -> None:
-        """Records the freshest market price per ticker (drives /api/brackets)."""
+        """Records the freshest market price per ticker (drives /api/brackets)
+        and advances the risk guard's daily clock off the bar timestamps."""
         self._last_prices[bar.symbol] = bar.close
+        if self.risk_guard is not None:
+            self.risk_guard.roll_day(bar.timestamp)
 
     def last_price(self, ticker: str) -> float | None:
         return self._last_prices.get(ticker)
@@ -181,7 +204,7 @@ class BaseExecutionGateway(ABC):
         requested_price = bar.open if gapped_through else level
 
         exit_action = SignalAction.SELL if bracket.side == "long" else SignalAction.BUY
-        fill = await self.execute_order(exit_action, bracket.size, bracket.ticker, requested_price)
+        fill = await self.execute_order(exit_action, bracket.size, bracket.ticker, requested_price, is_exit=True)
         bracket.status = status
         del self._brackets[order_id]
         return BracketExit(order_id=order_id, status=status, triggered_price=level, fill=fill)
@@ -240,11 +263,14 @@ class MockExecutionGateway(BaseExecutionGateway):
         size: float,
         ticker: str,
         requested_price: float,
+        *,
+        is_exit: bool = False,
     ) -> OrderFill:
         if size <= 0:
             raise GatewayError(f"order size must be positive, got {size}")
         if requested_price <= 0:
             raise GatewayError(f"requested price must be positive, got {requested_price}")
+        self.enforce_risk_guard(signal_type, is_exit)
         direction = self.adverse_direction(signal_type)
 
         started = time.perf_counter()
@@ -277,13 +303,27 @@ class MockExecutionGateway(BaseExecutionGateway):
         )
         self._fills.append(fill)
 
-        if signal_type in (SignalAction.BUY, SignalAction.SHORT):
+        if signal_type in (SignalAction.BUY, SignalAction.SHORT) and not is_exit:
             self._open_orders[fill.order_id] = fill
+            if self.risk_guard is not None:
+                self.risk_guard.register_entry(fill.timestamp)
         else:
-            # A close removes the oldest open order on the same ticker.
+            # A close removes the oldest open order on the same ticker and
+            # books the round-trip's realized PnL against the risk guard's
+            # daily loss budget. (`is_exit` matters: a short cover arrives as a
+            # market BUY and must match here, not extend the book.)
             for order_id, open_fill in list(self._open_orders.items()):
                 if open_fill.ticker == ticker:
                     del self._open_orders[order_id]
+                    if self.risk_guard is not None:
+                        entry_direction = 1.0 if open_fill.signal_type is SignalAction.BUY else -1.0
+                        pct_move = (
+                            entry_direction
+                            * (fill.filled_price - open_fill.filled_price)
+                            / open_fill.filled_price
+                        )
+                        realized = pct_move * open_fill.filled_size - open_fill.fees - fill.fees
+                        self.risk_guard.record_realized_pnl(realized, fill.timestamp)
                     break
         return fill
 
@@ -350,9 +390,12 @@ class LiveCCXTExecutionGateway(BaseExecutionGateway):
         size: float,
         ticker: str,
         requested_price: float,
+        *,
+        is_exit: bool = False,
     ) -> OrderFill:
         if size <= 0 or requested_price <= 0:
             raise GatewayError("order size and requested price must be positive")
+        self.enforce_risk_guard(signal_type, is_exit)
         direction = self.adverse_direction(signal_type)
         side = "buy" if direction > 0 else "sell"
         amount = size / requested_price  # notional dollars -> base-asset units
