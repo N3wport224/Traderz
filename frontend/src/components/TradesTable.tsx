@@ -28,6 +28,9 @@ export default function TradesTable({ title, trades }: TradesTableProps) {
                 <th className="py-1.5 pr-3 font-normal">Entry &rarr; Exit</th>
                 <th className="py-1.5 pr-3 font-normal">Size</th>
                 <th className="py-1.5 pr-3 font-normal">Fees</th>
+                <th className="py-1.5 pr-3 font-normal" title="Dollars lost to fill-price degradation (entry + exit)">
+                  Slip
+                </th>
                 <th className="py-1.5 font-normal text-right">Net P&amp;L</th>
               </tr>
             </thead>
@@ -40,6 +43,12 @@ export default function TradesTable({ title, trades }: TradesTableProps) {
                   </td>
                   <td className="py-1.5 pr-3">${trade.position_size.toFixed(0)}</td>
                   <td className="py-1.5 pr-3 text-zinc-500">${trade.fees.toFixed(2)}</td>
+                  <td
+                    className="py-1.5 pr-3 text-amber-400/80"
+                    title={`Requested $${trade.requested_price.toFixed(2)}, filled $${trade.actual_filled_price.toFixed(2)}`}
+                  >
+                    ${trade.slippage_cost.toFixed(2)}
+                  </td>
                   <td className={`py-1.5 text-right ${trade.net_profit >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
                     {trade.net_profit >= 0 ? "+" : ""}
                     {trade.net_profit.toFixed(2)}

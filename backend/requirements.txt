@@ -9,3 +9,8 @@ pytest-asyncio>=0.23
 sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
 greenlet>=3.0
+
+# Optional — only needed for live trading (GATEWAY_MODE=live). The
+# LiveCCXTExecutionGateway imports ccxt lazily, so mock-mode installs
+# (development, CI, tests) can skip it entirely.
+# ccxt>=4.3

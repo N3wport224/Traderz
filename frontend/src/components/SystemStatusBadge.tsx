@@ -4,12 +4,14 @@ const STYLES: Record<SystemStatus, string> = {
   RUNNING: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10",
   PAUSED: "text-amber-400 border-amber-500/30 bg-amber-500/10",
   HALTED_BY_DRAWDOWN: "text-rose-400 border-rose-500/30 bg-rose-500/10",
+  DATA_DISCONNECTED: "text-rose-400 border-rose-500/30 bg-rose-500/10",
 };
 
 const LABELS: Record<SystemStatus, string> = {
   RUNNING: "Running",
   PAUSED: "Paused",
   HALTED_BY_DRAWDOWN: "Halted by drawdown",
+  DATA_DISCONNECTED: "Data disconnected",
 };
 
 interface SystemStatusBadgeProps {

@@ -5,6 +5,7 @@ import type {
   RiskStatus,
   StrategyConfig,
   SwingConfig,
+  TelemetryStats,
   Trade,
   TradeSignal,
 } from "./types";
@@ -71,6 +72,10 @@ export async function updateSwingConfig(update: Partial<SwingConfig>): Promise<S
 
 export async function fetchRiskStatus(): Promise<RiskStatus> {
   return getJson<RiskStatus>("/api/risk/status");
+}
+
+export async function fetchTelemetry(): Promise<TelemetryStats> {
+  return getJson<TelemetryStats>("/api/telemetry");
 }
 
 export async function pauseSystem(): Promise<RiskStatus> {

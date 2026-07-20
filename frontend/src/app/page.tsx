@@ -2,23 +2,38 @@
 
 import { useState } from "react";
 
+import DataDisconnectedBanner from "@/components/DataDisconnectedBanner";
 import EnginePanel from "@/components/EnginePanel";
 import EquityChart from "@/components/EquityChart";
 import RiskControlsModal from "@/components/RiskControlsModal";
 import SystemStatusBadge from "@/components/SystemStatusBadge";
+import TelemetryBar from "@/components/TelemetryBar";
 import TradesTable from "@/components/TradesTable";
 import { useEngineFeed } from "@/hooks/useEngineFeed";
 import { useRiskStatus } from "@/hooks/useRiskStatus";
+import { useTelemetry } from "@/hooks/useTelemetry";
 
 export default function Dashboard() {
   const momentum = useEngineFeed("momentum");
   const swing = useEngineFeed("swing");
   const risk = useRiskStatus();
+  const { telemetry, unreachable } = useTelemetry();
   const [riskModalOpen, setRiskModalOpen] = useState(false);
+
+  const dataDisconnected = telemetry?.data_disconnected ?? risk.status?.data_disconnected ?? false;
 
   return (
     <div className="min-h-screen bg-black text-zinc-100">
       <main className="mx-auto flex max-w-6xl flex-col gap-6 px-6 py-8">
+        <TelemetryBar telemetry={telemetry} unreachable={unreachable} />
+
+        {dataDisconnected && (
+          <DataDisconnectedBanner
+            tickers={telemetry?.disconnected_tickers ?? risk.status?.disconnected_tickers ?? []}
+            streams={telemetry?.streams ?? {}}
+          />
+        )}
+
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-lg font-semibold tracking-tight text-zinc-100">Traderz</h1>

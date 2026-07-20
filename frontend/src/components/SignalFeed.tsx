@@ -7,6 +7,8 @@ const ACTION_STYLES: Record<TradeSignal["action"], string> = {
   exit: "text-amber-400 border-amber-500/30 bg-amber-500/10",
   alert: "text-sky-400 border-sky-500/30 bg-sky-500/10",
   circuit_breaker_triggered: "text-rose-300 border-rose-400/40 bg-rose-500/20 font-semibold",
+  data_disconnected: "text-rose-300 border-rose-400/40 bg-rose-500/20 font-semibold",
+  data_reconnected: "text-emerald-300 border-emerald-400/40 bg-emerald-500/20",
 };
 
 function formatTime(timestamp: string): string {
