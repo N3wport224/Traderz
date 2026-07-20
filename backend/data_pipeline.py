@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Any
 
+import httpx
 import numpy as np
 import pandas as pd
 
@@ -291,3 +294,293 @@ def bars_to_dataframe(bars: list[OHLCVBar]) -> pd.DataFrame:
         for bar in bars
     ]
     return pd.DataFrame.from_records(records).set_index("timestamp")[columns]
+
+
+# --- Phase 4: live market data feeds -----------------------------------------
+#
+# Two live sources, selected per symbol shape when DATA_SOURCE_MODE=live:
+#   - crypto pairs ("BTC/USDT" — anything with a slash) poll public OHLCV
+#     candles through CCXT (no credentials needed for market data);
+#   - stock tickers ("AAPL") poll Yahoo Finance's public chart API via httpx.
+# Both are plain async generators shaped exactly like the mock streams, and
+# both convert any transport/parse failure into `StreamDisconnected` so the
+# `ResilientStream` state machine handles live outages the same way it handles
+# simulated ones. Live data NEVER changes execution: the gateway stays
+# `MockExecutionGateway` unless GATEWAY_MODE=live is set explicitly (paper
+# trading by default — real charts, simulated fills).
+
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+# Yahoo rejects default library user agents; a browser-ish UA is required.
+YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Traderz/4.0"}
+
+# Yahoo has no native 4h interval: the 4h stream aggregates 60m candles.
+_YAHOO_PARAMS: dict[Timeframe, dict[str, str]] = {
+    Timeframe.ONE_MINUTE: {"interval": "1m", "range": "1d"},
+    Timeframe.FOUR_HOUR: {"interval": "60m", "range": "1mo"},
+}
+_CCXT_TIMEFRAMES: dict[Timeframe, str] = {
+    Timeframe.ONE_MINUTE: "1m",
+    Timeframe.FOUR_HOUR: "4h",
+}
+DEFAULT_POLL_SECONDS: dict[Timeframe, float] = {
+    Timeframe.ONE_MINUTE: 30.0,
+    Timeframe.FOUR_HOUR: 300.0,
+}
+
+DATA_SOURCE_MODES = ("mock", "live")
+
+
+def resolve_data_source_mode(mode: str | None = None) -> str:
+    """Normalizes DATA_SOURCE_MODE (arg wins over env; default mock)."""
+    resolved = (mode or os.environ.get("DATA_SOURCE_MODE", "mock")).lower()
+    if resolved not in DATA_SOURCE_MODES:
+        raise ValueError(f"DATA_SOURCE_MODE must be one of {DATA_SOURCE_MODES}, got {resolved!r}")
+    return resolved
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """CCXT market symbols are pair-shaped ("BTC/USDT"); stocks are bare tickers."""
+    return "/" in symbol
+
+
+def parse_yahoo_chart(payload: dict[str, Any], symbol: str, timeframe: Timeframe) -> list[OHLCVBar]:
+    """Converts a Yahoo v8 chart payload into OHLCVBars, skipping null rows
+    (Yahoo pads halted/thin minutes with nulls)."""
+    try:
+        result = payload["chart"]["result"][0]
+        timestamps: list[int | None] = result.get("timestamp") or []
+        quote = result["indicators"]["quote"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise StreamDisconnected(f"malformed Yahoo chart payload for {symbol}: {exc}") from exc
+
+    bars: list[OHLCVBar] = []
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    volumes = quote.get("volume") or []
+    for i, ts in enumerate(timestamps):
+        row = (ts, opens[i], highs[i], lows[i], closes[i])
+        if any(value is None for value in row):
+            continue
+        volume = volumes[i] if i < len(volumes) and volumes[i] is not None else 0
+        bars.append(
+            OHLCVBar(
+                symbol=symbol,
+                timestamp=datetime.fromtimestamp(int(ts), tz=timezone.utc),  # type: ignore[arg-type]
+                timeframe=timeframe,
+                open=round(float(opens[i]), 6),
+                high=round(float(highs[i]), 6),
+                low=round(float(lows[i]), 6),
+                close=round(float(closes[i]), 6),
+                volume=int(volume),
+            )
+        )
+    return bars
+
+
+def aggregate_bars(bars: list[OHLCVBar], timeframe: Timeframe, bucket_hours: int = 4) -> list[OHLCVBar]:
+    """Aggregates finer bars into `bucket_hours`-aligned buckets (e.g. 60m -> 4h).
+
+    Only *completed* buckets are returned — the trailing partial bucket is held
+    back until later input proves a newer bucket has started, so the swing
+    engine never sees a half-built candle that would mutate retroactively.
+    """
+    if not bars:
+        return []
+    buckets: dict[datetime, list[OHLCVBar]] = {}
+    for bar in bars:
+        start = bar.timestamp.replace(minute=0, second=0, microsecond=0)
+        start = start.replace(hour=start.hour - start.hour % bucket_hours)
+        buckets.setdefault(start, []).append(bar)
+
+    ordered_starts = sorted(buckets)
+    completed = ordered_starts[:-1]  # last bucket may still be filling
+    aggregated: list[OHLCVBar] = []
+    for start in completed:
+        chunk = sorted(buckets[start], key=lambda b: b.timestamp)
+        aggregated.append(
+            OHLCVBar(
+                symbol=chunk[0].symbol,
+                timestamp=start,
+                timeframe=timeframe,
+                open=chunk[0].open,
+                high=max(b.high for b in chunk),
+                low=min(b.low for b in chunk),
+                close=chunk[-1].close,
+                volume=sum(b.volume for b in chunk),
+            )
+        )
+    return aggregated
+
+
+async def stream_live_stock_bars(
+    symbol: str,
+    timeframe: Timeframe,
+    *,
+    client: httpx.AsyncClient | None = None,
+    poll_seconds: float | None = None,
+    max_polls: int | None = None,
+) -> AsyncIterator[OHLCVBar]:
+    """Polls Yahoo Finance's public chart API and yields new standardized bars.
+
+    The first poll backfills history (a day of 1m candles / a month of 60m
+    candles aggregated to 4h) so the engines have context immediately; later
+    polls yield only bars newer than the last one seen. Any HTTP/parse failure
+    raises `StreamDisconnected` for the `ResilientStream` wrapper to absorb.
+    """
+    delay = poll_seconds if poll_seconds is not None else DEFAULT_POLL_SECONDS[timeframe]
+    own_client = client is None
+    http = client or httpx.AsyncClient(timeout=10.0)
+    last_seen: datetime | None = None
+    polls = 0
+    try:
+        while max_polls is None or polls < max_polls:
+            try:
+                response = await http.get(
+                    YAHOO_CHART_URL.format(symbol=symbol),
+                    params=_YAHOO_PARAMS[timeframe],
+                    headers=YAHOO_HEADERS,
+                )
+                response.raise_for_status()
+                raw_bars = parse_yahoo_chart(response.json(), symbol, timeframe)
+            except httpx.HTTPError as exc:
+                raise StreamDisconnected(f"Yahoo chart request failed for {symbol}: {exc}") from exc
+            except ValueError as exc:  # response.json() decode failure
+                raise StreamDisconnected(f"Yahoo chart returned non-JSON for {symbol}: {exc}") from exc
+
+            if timeframe is Timeframe.FOUR_HOUR:
+                raw_bars = aggregate_bars(raw_bars, timeframe)
+            for bar in raw_bars:
+                if last_seen is None or bar.timestamp > last_seen:
+                    last_seen = bar.timestamp
+                    yield bar
+
+            polls += 1
+            if max_polls is not None and polls >= max_polls:
+                return
+            await asyncio.sleep(delay)
+    finally:
+        if own_client:
+            await http.aclose()
+
+
+async def stream_live_crypto_bars(
+    symbol: str,
+    timeframe: Timeframe,
+    *,
+    exchange: Any | None = None,
+    exchange_id: str = "binance",
+    poll_seconds: float | None = None,
+    max_polls: int | None = None,
+    backfill_limit: int = 300,
+) -> AsyncIterator[OHLCVBar]:
+    """Polls public OHLCV candles for a crypto pair through CCXT.
+
+    Market data needs no credentials — this constructs a keyless exchange
+    client (lazily importing ccxt, mirroring `LiveCCXTExecutionGateway`) unless
+    a pre-built one is injected (tests inject a fake). CCXT rows are
+    `[ms, open, high, low, close, volume]`. Failures raise `StreamDisconnected`.
+    """
+    delay = poll_seconds if poll_seconds is not None else DEFAULT_POLL_SECONDS[timeframe]
+    own_exchange = exchange is None
+    live_exchange: Any = exchange
+    if live_exchange is None:
+        try:
+            import ccxt.async_support as ccxt_async
+        except ImportError as exc:
+            raise StreamDisconnected(
+                "live crypto data requires the ccxt package: pip install ccxt"
+            ) from exc
+        try:
+            live_exchange = getattr(ccxt_async, exchange_id)({"enableRateLimit": True})
+        except AttributeError as exc:
+            raise StreamDisconnected(f"unknown CCXT exchange id: {exchange_id}") from exc
+
+    timeframe_str = _CCXT_TIMEFRAMES[timeframe]
+    last_seen_ms: int | None = None
+    polls = 0
+    try:
+        while max_polls is None or polls < max_polls:
+            since = None if last_seen_ms is None else last_seen_ms + 1
+            limit = backfill_limit if last_seen_ms is None else 100
+            try:
+                rows: list[list[float]] = await live_exchange.fetch_ohlcv(
+                    symbol, timeframe=timeframe_str, since=since, limit=limit
+                )
+            except Exception as exc:  # ccxt raises its own network/exchange error tree
+                raise StreamDisconnected(f"CCXT OHLCV fetch failed for {symbol}: {exc}") from exc
+
+            for row in rows:
+                try:
+                    ts_ms, open_, high, low, close, volume = (
+                        int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]),
+                        float(row[5]) if len(row) > 5 and row[5] is not None else 0.0,
+                    )
+                except (TypeError, ValueError, IndexError) as exc:
+                    raise StreamDisconnected(f"malformed CCXT candle for {symbol}: {row!r}") from exc
+                if last_seen_ms is not None and ts_ms <= last_seen_ms:
+                    continue
+                last_seen_ms = ts_ms
+                yield OHLCVBar(
+                    symbol=symbol,
+                    timestamp=datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc),
+                    timeframe=timeframe,
+                    open=open_,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=int(volume),
+                )
+
+            polls += 1
+            if max_polls is not None and polls >= max_polls:
+                return
+            await asyncio.sleep(delay)
+    finally:
+        if own_exchange and live_exchange is not None and hasattr(live_exchange, "close"):
+            await live_exchange.close()
+
+
+def build_stream_factory(
+    symbol: str,
+    timeframe: Timeframe,
+    *,
+    mode: str = "mock",
+    interval_seconds: float = 0.0,
+    poll_seconds: float | None = None,
+    http_client: httpx.AsyncClient | None = None,
+    exchange: Any | None = None,
+    exchange_id: str = "binance",
+) -> Callable[[], AsyncIterator[OHLCVBar]]:
+    """Builds a `ResilientStream`-compatible stream factory for one symbol/timeframe.
+
+    mode="mock": the existing random-walk generator (one generator shared across
+    reconnects so the walk continues). mode="live": Yahoo for stock tickers,
+    CCXT public data for crypto pairs. `http_client` / `exchange` exist so tests
+    (and the composition root) can inject transports — unit tests must never
+    touch the real network.
+    """
+    resolved = resolve_data_source_mode(mode)
+    if resolved == "mock":
+        generator = MockOHLCVGenerator(symbol)
+
+        def mock_factory() -> AsyncIterator[OHLCVBar]:
+            stream_fn = stream_1m_bars if timeframe is Timeframe.ONE_MINUTE else stream_4h_bars
+            return stream_fn(symbol, interval_seconds=interval_seconds, generator=generator)
+
+        return mock_factory
+
+    if is_crypto_symbol(symbol):
+
+        def crypto_factory() -> AsyncIterator[OHLCVBar]:
+            return stream_live_crypto_bars(
+                symbol, timeframe, exchange=exchange, exchange_id=exchange_id, poll_seconds=poll_seconds
+            )
+
+        return crypto_factory
+
+    def stock_factory() -> AsyncIterator[OHLCVBar]:
+        return stream_live_stock_bars(symbol, timeframe, client=http_client, poll_seconds=poll_seconds)
+
+    return stock_factory

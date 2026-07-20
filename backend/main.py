@@ -19,6 +19,7 @@ risk/config state, without leaking between test runs.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -31,22 +32,23 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import ConfigStore, ConfigValidationError
 from backend.data_pipeline import (
-    MockOHLCVGenerator,
     ResilientStream,
+    build_stream_factory,
     flaky_stream,
-    stream_1m_bars,
-    stream_4h_bars,
+    resolve_data_source_mode,
 )
 from backend.db import Database
 from backend.execution_gateway import LiveCCXTExecutionGateway, MockExecutionGateway
-from backend.models import ExecutionGateway, OHLCVBar, TradeSignal
+from backend.models import ExecutionGateway, OHLCVBar, Timeframe, TradeSignal
 from backend.notifier import ConsoleNotifier, Notifier, WebhookNotifier
 from backend.reconciliation import reconcile_on_boot
 from backend.risk_manager import RiskManager
-from backend.schemas import MomentumConfigUpdate, SwingConfigUpdate
+from backend.schemas import MomentumConfigUpdate, SwingConfigUpdate, WatchlistUpdate
 from backend.strategies.momentum_engine import MomentumEngine
 from backend.strategies.swing_engine import SwingEngine
 from backend.telemetry import TelemetryTracker, configure_json_logging
+
+logger = logging.getLogger("traderz.main")
 
 SYMBOL = "MOCK"
 MOMENTUM_TICK_SECONDS = 1.0
@@ -138,6 +140,11 @@ def create_app(
     json_log_path: str | None = None,
     simulate_disconnect_after: int | None = None,
     backoff_scale: float = 1.0,
+    symbol: str | None = None,
+    data_source_mode: str | None = None,
+    live_poll_seconds: float | None = None,
+    live_http_client: Any | None = None,
+    live_exchange: Any | None = None,
 ) -> FastAPI:
     """Composition root.
 
@@ -146,6 +153,13 @@ def create_app(
     bars — a live demo of the reconnection state machine; `backoff_scale`
     shrinks its real-time delays for tests. `json_log_path` overrides the
     structured-log destination (env: LOG_JSON_PATH, default `logging.json`).
+
+    Phase 4: `data_source_mode` ("mock"/"live", default env DATA_SOURCE_MODE)
+    selects the market data source; `symbol` seeds the watchlist (default env
+    WATCHLIST_SYMBOL, else "MOCK"); `live_http_client` / `live_exchange` inject
+    transports for the live feeds so tests never hit the real network. Data
+    source and execution are deliberately independent: live data with the
+    default mock gateway is the paper-trading configuration.
     """
     database = Database(database_url)
     config_store = ConfigStore()
@@ -153,10 +167,16 @@ def create_app(
     notifier = _build_notifier()
     telemetry = TelemetryTracker()
     execution_gateway = gateway if gateway is not None else _build_gateway()
+    source_mode = resolve_data_source_mode(data_source_mode)
     momentum_state = EngineState()
     swing_state = EngineState()
     resilient_streams: dict[str, ResilientStream] = {}
     boot_report: dict[str, Any] = {}
+    watch: dict[str, Any] = {
+        "symbol": (symbol or os.environ.get("WATCHLIST_SYMBOL", SYMBOL)).upper(),
+        "tasks": [],
+    }
+    watch_lock = asyncio.Lock()
 
     async def _run_engine_worker(engine: MomentumEngine | SwingEngine, bar_stream: Any, state: EngineState) -> None:
         async for signal in engine.run(bar_stream):
@@ -164,16 +184,82 @@ def create_app(
             await state.connections.broadcast(payload)
             await notifier.notify_signal(signal)
 
-    def _resilient(name: str, factory: Any) -> ResilientStream:
+    def _resilient(name: str, ticker: str, factory: Any) -> ResilientStream:
         stream = ResilientStream(
             factory,
-            SYMBOL,
+            ticker,
             risk_manager=risk_manager,
             notifier=notifier,
             backoff_scale=backoff_scale,
         )
         resilient_streams[name] = stream
         return stream
+
+    def _stream_factory_for(ticker: str, timeframe: Timeframe) -> Any:
+        interval = momentum_interval_seconds if timeframe is Timeframe.ONE_MINUTE else swing_interval_seconds
+        base = build_stream_factory(
+            ticker,
+            timeframe,
+            mode=source_mode,
+            interval_seconds=interval,
+            poll_seconds=live_poll_seconds,
+            http_client=live_http_client,
+            exchange=live_exchange,
+            exchange_id=os.environ.get("EXCHANGE_ID", "binance"),
+        )
+        if source_mode == "mock" and simulate_disconnect_after is not None:
+            drop_at = simulate_disconnect_after  # narrowed int for the closure
+
+            def flaky_factory() -> AsyncIterator[OHLCVBar]:
+                return flaky_stream(base(), drop_after=[drop_at])
+
+            return flaky_factory
+        return base
+
+    async def _start_engines(ticker: str) -> None:
+        """(Re)creates both engines and their resilient streams for `ticker`."""
+        momentum_engine = MomentumEngine(
+            ticker,
+            config_store=config_store,
+            risk_manager=risk_manager,
+            persistence=database,
+            gateway=execution_gateway,
+            telemetry=telemetry,
+            starting_equity=await database.get_latest_equity(MomentumEngine.ENGINE_TYPE),
+        )
+        swing_engine = SwingEngine(
+            ticker,
+            config_store=config_store,
+            risk_manager=risk_manager,
+            persistence=database,
+            gateway=execution_gateway,
+            telemetry=telemetry,
+            starting_equity=await database.get_latest_equity(SwingEngine.ENGINE_TYPE),
+        )
+        momentum_stream = _resilient("momentum", ticker, _stream_factory_for(ticker, Timeframe.ONE_MINUTE))
+        swing_stream = _resilient("swing", ticker, _stream_factory_for(ticker, Timeframe.FOUR_HOUR))
+        watch["symbol"] = ticker
+        watch["tasks"] = [
+            asyncio.create_task(_run_engine_worker(momentum_engine, momentum_stream.bars(), momentum_state)),
+            asyncio.create_task(_run_engine_worker(swing_engine, swing_stream.bars(), swing_state)),
+        ]
+        logger.info(
+            "engines started",
+            extra={"event": "engines_started", "ticker": ticker, "data_source_mode": source_mode},
+        )
+
+    async def _stop_engines() -> None:
+        tasks = watch["tasks"]
+        watch["tasks"] = []
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # worker died mid-cancel — still shut down
+                pass
+        # A stream torn down mid-outage must not leave its ticker flagged forever.
+        risk_manager.mark_data_verified(watch["symbol"])
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -185,65 +271,18 @@ def create_app(
         report = await reconcile_on_boot(execution_gateway, database)
         boot_report.update(report.as_dict())
 
-        momentum_starting_equity = await database.get_latest_equity(MomentumEngine.ENGINE_TYPE)
-        swing_starting_equity = await database.get_latest_equity(SwingEngine.ENGINE_TYPE)
-
-        momentum_engine = MomentumEngine(
-            SYMBOL,
-            config_store=config_store,
-            risk_manager=risk_manager,
-            persistence=database,
-            gateway=execution_gateway,
-            telemetry=telemetry,
-            starting_equity=momentum_starting_equity,
-        )
-        swing_engine = SwingEngine(
-            SYMBOL,
-            config_store=config_store,
-            risk_manager=risk_manager,
-            persistence=database,
-            gateway=execution_gateway,
-            telemetry=telemetry,
-            starting_equity=swing_starting_equity,
-        )
-
-        # Each engine keeps one generator across reconnects so the simulated
-        # price walk continues instead of restarting on every new connection.
-        momentum_generator = MockOHLCVGenerator(SYMBOL)
-        swing_generator = MockOHLCVGenerator(SYMBOL)
-
-        def momentum_stream_factory() -> AsyncIterator[OHLCVBar]:
-            base = stream_1m_bars(
-                SYMBOL, interval_seconds=momentum_interval_seconds, generator=momentum_generator
+        if isinstance(execution_gateway, MockExecutionGateway):
+            logger.info(
+                "PAPER TRADING: orders fill through the mock gateway (simulated slippage/fees); "
+                "no real capital is at risk",
+                extra={"event": "paper_trading", "data_source_mode": source_mode},
             )
-            if simulate_disconnect_after is not None:
-                return flaky_stream(base, drop_after=[simulate_disconnect_after])
-            return base
 
-        def swing_stream_factory() -> AsyncIterator[OHLCVBar]:
-            base = stream_4h_bars(SYMBOL, interval_seconds=swing_interval_seconds, generator=swing_generator)
-            if simulate_disconnect_after is not None:
-                return flaky_stream(base, drop_after=[simulate_disconnect_after])
-            return base
-
-        momentum_task = asyncio.create_task(
-            _run_engine_worker(
-                momentum_engine, _resilient("momentum", momentum_stream_factory).bars(), momentum_state
-            )
-        )
-        swing_task = asyncio.create_task(
-            _run_engine_worker(swing_engine, _resilient("swing", swing_stream_factory).bars(), swing_state)
-        )
+        await _start_engines(watch["symbol"])
         try:
             yield
         finally:
-            momentum_task.cancel()
-            swing_task.cancel()
-            for task in (momentum_task, swing_task):
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            await _stop_engines()
             await database.dispose()
 
     app = FastAPI(title="Traderz Multi-Engine Trading System", lifespan=lifespan)
@@ -279,13 +318,39 @@ def create_app(
 
     @app.get("/api/momentum/trades")
     async def momentum_trades() -> list[dict[str, Any]]:
-        rows = await database.get_trades(MomentumEngine.ENGINE_TYPE)
+        rows = await database.get_trades(MomentumEngine.ENGINE_TYPE, asset_ticker=watch["symbol"])
         return [_trade_to_json(row) for row in rows]
 
     @app.get("/api/swing/trades")
     async def swing_trades() -> list[dict[str, Any]]:
-        rows = await database.get_trades(SwingEngine.ENGINE_TYPE)
+        rows = await database.get_trades(SwingEngine.ENGINE_TYPE, asset_ticker=watch["symbol"])
         return [_trade_to_json(row) for row in rows]
+
+    @app.get("/api/watchlist")
+    async def get_watchlist() -> dict[str, Any]:
+        return {"ticker": watch["symbol"], "data_source_mode": source_mode}
+
+    @app.post("/api/watchlist")
+    async def update_watchlist(update: WatchlistUpdate) -> dict[str, Any]:
+        """Switches every stream and engine to a new asset.
+
+        Tears down the current workers, wipes the in-memory signal feeds (the
+        dashboard starts a fresh chart), and subscribes both engines to the new
+        ticker's streams. Serialized behind a lock so concurrent submissions
+        can't interleave teardown/startup.
+        """
+        async with watch_lock:
+            ticker = update.ticker
+            if ticker != watch["symbol"]:
+                await _stop_engines()
+                momentum_state.signals.clear()
+                swing_state.signals.clear()
+                await _start_engines(ticker)
+                logger.info(
+                    "watchlist switched",
+                    extra={"event": "watchlist_switched", "ticker": ticker},
+                )
+            return {"ticker": watch["symbol"], "data_source_mode": source_mode}
 
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:
@@ -322,6 +387,8 @@ def create_app(
         stats["system_status"] = risk_manager.system_status()
         stats["data_disconnected"] = risk_manager.is_data_disconnected()
         stats["disconnected_tickers"] = risk_manager.disconnected_tickers
+        stats["ticker"] = watch["symbol"]
+        stats["data_source_mode"] = source_mode
         stats["streams"] = {
             name: {
                 "state": stream.state.value,

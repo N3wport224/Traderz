@@ -15,6 +15,12 @@ frontend/.next/
 frontend/out/
 frontend/.env*.local
 
+# Secrets — real credentials never enter git (see CLAUDE.md rule 6).
+# `.env.example` is the only tracked env file; it must contain placeholders only.
+.env
+.env.*
+!.env.example
+
 # Editors / OS
 .DS_Store
 .vscode/

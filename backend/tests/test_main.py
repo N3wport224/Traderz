@@ -259,3 +259,151 @@ def test_simulated_stream_drop_surfaces_data_disconnected_status() -> None:
         streams = telemetry["streams"]
         assert streams["momentum"]["disconnect_count"] >= 1 or streams["swing"]["disconnect_count"] >= 1
         assert client.get("/api/risk/status").json()["system_status"] == "DATA_DISCONNECTED"
+
+
+# --- Phase 4: watchlist, live data mode, paper-trading lock -------------------
+
+
+def test_watchlist_defaults_to_mock_symbol() -> None:
+    with new_client() as client:
+        body = client.get("/api/watchlist").json()
+        assert body == {"ticker": "MOCK", "data_source_mode": "mock"}
+
+
+def test_watchlist_switch_wipes_signals_and_streams_new_ticker() -> None:
+    app = create_app("sqlite+aiosqlite:///:memory:", momentum_interval_seconds=0.02, swing_interval_seconds=0.05)
+    with TestClient(app) as client:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not client.get("/api/momentum/signals").json():
+            time.sleep(0.1)
+        assert client.get("/api/momentum/signals").json(), "expected MOCK signals before the switch"
+
+        response = client.post("/api/watchlist", json={"ticker": "tsla"})
+        assert response.status_code == 200
+        assert response.json()["ticker"] == "TSLA"  # normalized to uppercase
+
+        # old-symbol signals are gone the moment the switch returns
+        residual = client.get("/api/momentum/signals").json()
+        assert all(s["symbol"] == "TSLA" for s in residual)
+
+        deadline = time.monotonic() + 10.0
+        fresh: list[dict[str, Any]] = []
+        while time.monotonic() < deadline and not fresh:
+            time.sleep(0.1)
+            fresh = client.get("/api/momentum/signals").json()
+        assert fresh and fresh[0]["symbol"] == "TSLA"
+
+        assert client.get("/api/watchlist").json()["ticker"] == "TSLA"
+        assert client.get("/api/telemetry").json()["ticker"] == "TSLA"
+
+
+def test_watchlist_trades_are_filtered_to_the_active_ticker() -> None:
+    """After a switch, the trades endpoints only show the active asset —
+    the dashboard starts from a clean view instead of mixing symbols."""
+    app = create_app("sqlite+aiosqlite:///:memory:", momentum_interval_seconds=0.02, swing_interval_seconds=0.05)
+    with TestClient(app) as client:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not client.get("/api/momentum/trades").json():
+            time.sleep(0.1)
+        assert client.get("/api/momentum/trades").json(), "expected a closed MOCK trade first"
+
+        client.post("/api/watchlist", json={"ticker": "AAPL"})
+        trades_after_switch = client.get("/api/momentum/trades").json()
+        assert all(t["asset_ticker"] == "AAPL" for t in trades_after_switch)
+
+
+def test_watchlist_rejects_invalid_tickers() -> None:
+    with new_client() as client:
+        for bad in ("not a ticker!!", "", "toolongtickersymbolxxxxxxxxx", "BTC//USDT", "a/b/c"):
+            response = client.post("/api/watchlist", json={"ticker": bad})
+            assert response.status_code == 422, f"expected 422 for {bad!r}"
+
+
+def test_watchlist_accepts_stock_and_crypto_shapes() -> None:
+    with new_client() as client:
+        for good, normalized in (("aapl", "AAPL"), ("BRK.B", "BRK.B"), ("btc/usdt", "BTC/USDT")):
+            response = client.post("/api/watchlist", json={"ticker": good})
+            assert response.status_code == 200
+            assert response.json()["ticker"] == normalized
+
+
+def test_watchlist_same_ticker_is_a_no_op() -> None:
+    app = create_app("sqlite+aiosqlite:///:memory:", momentum_interval_seconds=0.02, swing_interval_seconds=0.05)
+    with TestClient(app) as client:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not client.get("/api/momentum/signals").json():
+            time.sleep(0.1)
+        before = client.get("/api/momentum/signals").json()
+        assert before
+
+        assert client.post("/api/watchlist", json={"ticker": "MOCK"}).status_code == 200
+        after = client.get("/api/momentum/signals").json()
+        assert len(after) >= len(before)  # signals were NOT wiped for a same-ticker submit
+
+
+def _yahoo_payload(n: int) -> dict[str, Any]:
+    base_ts = 1_753_000_000
+    return {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": [base_ts + i * 60 for i in range(n)],
+                    "indicators": {
+                        "quote": [
+                            {
+                                "open": [100.0 + i for i in range(n)],
+                                "high": [101.0 + i for i in range(n)],
+                                "low": [99.0 + i for i in range(n)],
+                                "close": [100.5 + i for i in range(n)],
+                                "volume": [1_000] * n,
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    }
+
+
+def test_live_data_mode_remains_paper_trading_with_mock_gateway() -> None:
+    """DATA_SOURCE_MODE=live must not flip execution live: real (mocked-HTTP)
+    market data flows in, but orders still fill through MockExecutionGateway —
+    the Phase 4 paper-trading guarantee. No real network is touched: the app
+    gets an injected httpx client backed by MockTransport."""
+    import httpx
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=_yahoo_payload(min(3 + calls["n"], 30)))
+
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(
+        "sqlite+aiosqlite:///:memory:",
+        data_source_mode="live",
+        symbol="AAPL",
+        live_http_client=injected,
+        live_poll_seconds=0.05,
+    )
+    with TestClient(app) as client:
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and calls["n"] < 2:
+            time.sleep(0.1)
+
+        telemetry = client.get("/api/telemetry").json()
+        assert telemetry["data_source_mode"] == "live"
+        assert telemetry["ticker"] == "AAPL"
+        assert telemetry["gateway"] == {"name": "MOCK", "mode": "mock"}  # paper trading
+        assert calls["n"] >= 2  # both timeframes polled through the mocked transport
+
+
+def test_gateway_mode_env_defaults_to_mock_even_when_data_is_live(monkeypatch: Any) -> None:
+    """Belt-and-braces: without an explicit GATEWAY_MODE=live, the env-driven
+    gateway builder must return the mock gateway regardless of DATA_SOURCE_MODE."""
+    from backend.execution_gateway import MockExecutionGateway
+    from backend.main import _build_gateway
+
+    monkeypatch.delenv("GATEWAY_MODE", raising=False)
+    monkeypatch.setenv("DATA_SOURCE_MODE", "live")
+    assert isinstance(_build_gateway(), MockExecutionGateway)

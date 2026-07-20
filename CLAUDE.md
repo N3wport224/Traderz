@@ -11,16 +11,30 @@ slippage/latency/partial fills by default, CCXT live mode via `GATEWAY_MODE=live
 `API_KEY`/`API_SECRET`), a reconnection state machine over the data streams with a
 `DATA_DISCONNECTED` risk state, boot-time gateway-vs-DB reconciliation, structured
 JSON logging with signal→approval→fill latency telemetry, and a frontend telemetry
-bar + outage banner.
+bar + outage banner. Phase 4 adds live market data behind `DATA_SOURCE_MODE=live`
+(stock tickers poll Yahoo Finance's public chart API; crypto pairs poll public
+CCXT OHLCV — both credential-free) parsed into the same 1m/4h bar shapes, a
+dashboard Asset Selector backed by `POST /api/watchlist` that dynamically resubscribes
+both engines to any ticker, and a root `.env.example` documenting all configuration.
+Live data and execution are deliberately independent: with the default
+`GATEWAY_MODE=mock` the system is a true paper trader — real charts, simulated fills,
+no real capital at risk.
 
 ## Architecture
 
 - `backend/` — Python (FastAPI, asyncio, pandas, SQLAlchemy async) core engine and API.
-  - `backend/data_pipeline.py` — async mock OHLCV ingestion (1m and 4h streams), plus
+  - `backend/data_pipeline.py` — OHLCV ingestion (1m and 4h streams): mock random-walk
+    generators plus, behind `DATA_SOURCE_MODE=live`, real feeds — Yahoo Finance public
+    chart polling for stocks (60m candles aggregated into aligned 4h buckets, partial
+    bucket held back) and public CCXT OHLCV polling for crypto pairs; both parse into
+    the standard `OHLCVBar` and raise `StreamDisconnected` on any transport/parse
+    failure. `build_stream_factory` routes symbol+timeframe+mode to the right stream.
     `ResilientStream`: the reconnection state machine (CONNECTED → DISCONNECTED →
     RECONNECTING with 2s→64s exponential backoff → VERIFYING → CONNECTED) that wraps
-    each stream, alerts the notifier, and flags the ticker on the shared `RiskManager`
-    until integrity is re-verified. Backoff resets only after a *verified* reconnect.
+    each stream (mock or live), alerts the notifier, and flags the ticker on the shared
+    `RiskManager` until integrity is re-verified. Backoff resets only after a *verified*
+    reconnect. Tests must never hit the real network — inject `httpx.MockTransport`
+    clients / fake CCXT exchanges (see `backend/tests/test_live_data.py`).
   - `backend/models.py` — shared dataclasses/enums plus the injected protocols
     (`TradePersistence`, `ExecutionGateway`, `OrderFlowTelemetry`) and the
     `NullPersistence` default; the one module every engine may import freely.
@@ -97,3 +111,12 @@ bar + outage banner.
    (see `SwingEngine.max_bar_history`) rather than let it grow unboundedly — an
    O(n) or worse per-bar cost over an ever-growing buffer becomes a real hang under
    a fast or unpaced bar stream, not just a theoretical concern.
+6. **No real credentials in git — ever.** Never commit `.env`, `.env.local`, or any
+   file containing real API keys, exchange secrets, webhook URLs, or database
+   passwords. The tracked `.env.example` is the only env file allowed in the repo
+   and must contain placeholders/empty values only (`.gitignore` enforces this —
+   do not weaken those rules). Real credentials live exclusively in untracked
+   local files or the deployment environment. Relatedly, paper trading is the
+   default posture: `GATEWAY_MODE` stays `mock` unless a human deliberately opts
+   into live execution — code must never auto-promote the gateway to live because
+   data happens to be live.

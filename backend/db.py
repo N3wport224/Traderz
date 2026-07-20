@@ -11,8 +11,11 @@ module (or SQLAlchemy) at all.
 
 from __future__ import annotations
 
+import asyncio
 import os
+from collections.abc import Coroutine
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import Float, String, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -93,6 +96,7 @@ class Database:
         self.database_url = database_url or os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
         self._engine = create_async_engine(self.database_url, **_engine_kwargs(self.database_url))
         self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
+        self._pending_writes: set[asyncio.Task[None]] = set()
 
     async def init(self) -> None:
         """Creates all tables if they don't already exist."""
@@ -100,9 +104,30 @@ class Database:
             await conn.run_sync(Base.metadata.create_all)
 
     async def dispose(self) -> None:
+        # Let any shielded writes land before tearing the engine down.
+        if self._pending_writes:
+            await asyncio.gather(*list(self._pending_writes), return_exceptions=True)
         await self._engine.dispose()
 
+    async def _shielded_write(self, coro: Coroutine[Any, Any, None]) -> None:
+        """Runs a write so that cancelling the *caller* cannot interrupt it.
+
+        Engine workers get hard-cancelled on shutdown and on watchlist switches.
+        A task cancelled mid-commit severs the underlying DBAPI connection —
+        and under SQLite's StaticPool (notably the in-memory databases tests
+        use) the replacement connection is a brand-new empty database. Shielding
+        lets an in-flight commit finish even though the worker is going away;
+        `dispose()` waits for stragglers.
+        """
+        task = asyncio.ensure_future(coro)
+        self._pending_writes.add(task)
+        task.add_done_callback(self._pending_writes.discard)
+        await asyncio.shield(task)
+
     async def record_trade(self, trade: TradeRecord) -> None:
+        await self._shielded_write(self._record_trade(trade))
+
+    async def _record_trade(self, trade: TradeRecord) -> None:
         async with self._session_factory() as session:
             session.add(
                 Trade(
@@ -123,6 +148,9 @@ class Database:
             await session.commit()
 
     async def record_open_position(self, position: OpenPositionRecord) -> None:
+        await self._shielded_write(self._record_open_position(position))
+
+    async def _record_open_position(self, position: OpenPositionRecord) -> None:
         async with self._session_factory() as session:
             session.add(
                 OpenPosition(
@@ -140,6 +168,9 @@ class Database:
             await session.commit()
 
     async def clear_open_position(self, engine_type: str, asset_ticker: str) -> None:
+        await self._shielded_write(self._clear_open_position(engine_type, asset_ticker))
+
+    async def _clear_open_position(self, engine_type: str, asset_ticker: str) -> None:
         async with self._session_factory() as session:
             await session.execute(
                 delete(OpenPosition)
@@ -176,15 +207,19 @@ class Database:
             return float(result.scalar_one())
 
     async def record_equity_snapshot(self, engine_type: str, timestamp: datetime, equity: float) -> None:
+        await self._shielded_write(self._record_equity_snapshot(engine_type, timestamp, equity))
+
+    async def _record_equity_snapshot(self, engine_type: str, timestamp: datetime, equity: float) -> None:
         async with self._session_factory() as session:
             session.add(EquitySnapshot(engine_type=engine_type, timestamp=timestamp, equity=equity))
             await session.commit()
 
-    async def get_trades(self, engine_type: str) -> list[Trade]:
+    async def get_trades(self, engine_type: str, asset_ticker: str | None = None) -> list[Trade]:
         async with self._session_factory() as session:
-            result = await session.execute(
-                select(Trade).where(Trade.engine_type == engine_type).order_by(Trade.exit_timestamp)
-            )
+            query = select(Trade).where(Trade.engine_type == engine_type).order_by(Trade.exit_timestamp)
+            if asset_ticker is not None:
+                query = query.where(Trade.asset_ticker == asset_ticker)
+            result = await session.execute(query)
             return list(result.scalars().all())
 
     async def get_equity_curve(self, engine_type: str) -> list[EquitySnapshot]:
