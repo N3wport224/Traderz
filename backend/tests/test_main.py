@@ -727,3 +727,78 @@ def test_rest_transport_reports_no_websocket_block() -> None:
         assert telemetry["transport"] == "rest"
         assert telemetry["websocket"] is None
         assert telemetry["stream_latency_ms"] is None
+
+
+# --- Phase 8: system notifier wiring ------------------------------------------
+
+
+def _webhook_notifier() -> tuple[Any, list[str]]:
+    """A SystemNotifier bound to a capturing MockTransport webhook."""
+    import json
+
+    import httpx
+
+    from backend.utils.notifier import SystemNotifier
+
+    contents: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        contents.append(json.loads(request.content.decode())["content"])
+        return httpx.Response(204)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return SystemNotifier("https://hooks.example.test/system", client=client), contents
+
+
+def test_boot_fires_engines_online_info_notification() -> None:
+    notifier, contents = _webhook_notifier()
+    app = create_app("sqlite+aiosqlite:///:memory:", system_notifier=notifier)
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        assert any("INFO: Engines online" in c for c in contents)
+        boot = [e for e in notifier.history if e["title"] == "Engines online"]
+        assert boot and boot[0]["context"]["ticker"] == "MOCK"
+
+
+def test_kill_switch_fires_alert_notification() -> None:
+    notifier, contents = _webhook_notifier()
+    app = create_app("sqlite+aiosqlite:///:memory:", system_notifier=notifier)
+    with TestClient(app) as client:
+        client.post("/api/system/kill")
+        assert any("ALERT: EMERGENCY KILL SWITCH ENGAGED" in c for c in contents)
+        kill = [e for e in notifier.history if e["level"] == "ALERT"]
+        assert kill and kill[0]["context"]["source"] == "dashboard"
+
+
+def test_notifier_test_endpoint_reports_delivery() -> None:
+    notifier, contents = _webhook_notifier()
+    app = create_app("sqlite+aiosqlite:///:memory:", system_notifier=notifier)
+    with TestClient(app) as client:
+        response = client.post("/api/system/notifier/test")
+        assert response.status_code == 200
+        assert response.json() == {
+            "configured": True,
+            "delivered": True,
+            "detail": "webhook accepted the test ping",
+        }
+        assert any("Connectivity test" in c for c in contents)
+
+
+def test_notifier_test_endpoint_log_only_without_webhook(monkeypatch: Any) -> None:
+    monkeypatch.delenv("SYSTEM_WEBHOOK_URL", raising=False)
+    with new_client() as client:
+        body = client.post("/api/system/notifier/test").json()
+        assert body["configured"] is False
+        assert body["delivered"] is False
+        assert "log-only" in body["detail"]
+
+
+def test_telemetry_exposes_notifier_status() -> None:
+    notifier, _ = _webhook_notifier()
+    app = create_app("sqlite+aiosqlite:///:memory:", system_notifier=notifier)
+    with TestClient(app) as client:
+        stats = client.get("/api/telemetry").json()
+        assert stats["notifier"]["configured"] is True
+        assert stats["notifier"]["delivered_count"] >= 1  # boot INFO already delivered
+        titles = [e["title"] for e in stats["notifier"]["recent_events"]]
+        assert "Engines online" in titles

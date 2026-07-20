@@ -47,6 +47,7 @@ from backend.notifier import ConsoleNotifier, Notifier, WebhookNotifier
 from backend.reconciliation import reconcile_on_boot
 from backend.risk_manager import RiskManager
 from backend.schemas import BacktestRequest, MomentumConfigUpdate, SwingConfigUpdate, WatchlistUpdate
+from backend.utils.notifier import SystemNotifier
 from backend.utils.risk_guard import RiskGuard
 from backend.strategies.momentum_engine import MomentumEngine
 from backend.strategies.swing_engine import SwingEngine
@@ -151,6 +152,7 @@ def create_app(
     live_http_client: Any | None = None,
     live_exchange: Any | None = None,
     ws_provider: Any | None = None,
+    system_notifier: SystemNotifier | None = None,
 ) -> FastAPI:
     """Composition root.
 
@@ -173,12 +175,28 @@ def create_app(
     notifier = _build_notifier()
     telemetry = TelemetryTracker()
     execution_gateway = gateway if gateway is not None else _build_gateway()
+    # Phase 8 production alerting: guard trips / kill switch / boot events go
+    # out-of-browser through the system webhook (log-only when unconfigured).
+    sys_notifier = system_notifier if system_notifier is not None else SystemNotifier()
+
+    def _alert_async(title: str, message: str, **context: Any) -> None:
+        """Schedules an alert without blocking the (sync) hot path caller."""
+        try:
+            asyncio.get_running_loop().create_task(sys_notifier.alert(title, message, **context))
+        except RuntimeError:  # no loop (import-time construction) — log-only
+            logger.warning("alert outside event loop: %s — %s", title, message)
+
     # Operational risk guard (Phase 6): env-configured limits in front of every
     # entry. A trip halts the risk manager so engines flatten on their next bar.
-    risk_guard = RiskGuard.from_env(
-        risk_manager.total_capital,
-        on_trip=lambda reason: risk_manager.halt(f"risk_guard: {reason}"),
-    )
+    def _on_guard_trip(reason: str) -> None:
+        risk_manager.halt(f"risk_guard: {reason}")
+        _alert_async(
+            "RISK GUARD TRIPPED — bot locked",
+            "All open positions are being flattened and further entries are rejected.",
+            reason=reason,
+        )
+
+    risk_guard = RiskGuard.from_env(risk_manager.total_capital, on_trip=_on_guard_trip)
     # Phase 7 crash-safety: every guard mutation upserts the SystemState row.
     risk_guard.persist_hook = database.save_system_state
     if execution_gateway.risk_guard is None:
@@ -301,14 +319,23 @@ def create_app(
             asyncio.create_task(_run_engine_worker(momentum_engine, momentum_bar_stream, momentum_state)),
             asyncio.create_task(_run_engine_worker(swing_engine, swing_stream.bars(), swing_state)),
         ]
+        transport_label = "websocket" if watch["ws_factory"] is not None else "rest"
         logger.info(
             "engines started",
             extra={
                 "event": "engines_started",
                 "ticker": ticker,
                 "data_source_mode": source_mode,
-                "transport": "websocket" if watch["ws_factory"] is not None else "rest",
+                "transport": transport_label,
             },
+        )
+        await sys_notifier.info(
+            "Engines online",
+            "Momentum and swing engines initialized and streaming.",
+            ticker=ticker,
+            data_source_mode=source_mode,
+            transport=transport_label,
+            gateway=execution_gateway.name,
         )
 
     async def _stop_engines() -> None:
@@ -364,6 +391,8 @@ def create_app(
             await _stop_engines()
             await risk_guard.flush_persists()  # final state lands before teardown
             await database.dispose()
+            if system_notifier is None:  # close only the client we created
+                await sys_notifier.aclose()
 
     app = FastAPI(title="Traderz Multi-Engine Trading System", lifespan=lifespan)
 
@@ -530,6 +559,13 @@ def create_app(
         risk_guard.force_circuit_breaker(True)
         risk_manager.halt("risk_guard: circuit_breaker_forced")
         logger.warning("EMERGENCY KILL SWITCH ENGAGED", extra={"event": "kill_switch"})
+        await sys_notifier.alert(
+            "EMERGENCY KILL SWITCH ENGAGED",
+            "Operator forced the circuit breaker from the dashboard — "
+            "open positions are being flattened and all new entries are rejected.",
+            source="dashboard",
+            ticker=watch["symbol"],
+        )
         status = risk_manager.status()
         status["risk_guard"] = risk_guard.status()
         return status
@@ -632,7 +668,14 @@ def create_app(
             for name, stream in resilient_streams.items()
         }
         stats["boot_reconciliation"] = dict(boot_report)
+        stats["notifier"] = sys_notifier.status()
         return stats
+
+    @app.post("/api/system/notifier/test")
+    async def notifier_test() -> dict[str, Any]:
+        """Fires a connectivity test ping through the system webhook (or reports
+        log-only mode) so operators can verify alert routing from the UI."""
+        return await sys_notifier.test_ping()
 
     @app.post("/api/system/pause")
     async def pause_system() -> dict[str, Any]:
