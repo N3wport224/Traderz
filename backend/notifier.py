@@ -8,6 +8,7 @@ received from an engine's signal stream — no batching, no delay.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Protocol
 
 import httpx
@@ -16,12 +17,22 @@ from backend.models import SignalAction, TradeSignal
 
 logger = logging.getLogger("traderz.notifier")
 
-NOTIFIABLE_ACTIONS = frozenset({SignalAction.BUY, SignalAction.SHORT, SignalAction.CIRCUIT_BREAKER})
+NOTIFIABLE_ACTIONS = frozenset(
+    {
+        SignalAction.BUY,
+        SignalAction.SHORT,
+        SignalAction.CIRCUIT_BREAKER,
+        SignalAction.DATA_DISCONNECTED,
+        SignalAction.DATA_RECONNECTED,
+    }
+)
 
 _ICONS: dict[SignalAction, str] = {
     SignalAction.BUY: "\U0001f7e2",
     SignalAction.SHORT: "\U0001f534",
     SignalAction.CIRCUIT_BREAKER: "\U0001f6d1",
+    SignalAction.DATA_DISCONNECTED: "⚠️",
+    SignalAction.DATA_RECONNECTED: "✅",
 }
 
 
@@ -77,3 +88,27 @@ class Notifier:
         message = format_signal(signal)
         for sink in self.sinks:
             await sink.send(message)
+
+    async def notify_data_event(
+        self,
+        action: SignalAction,
+        ticker: str,
+        timestamp: datetime,
+        reason: str,
+    ) -> None:
+        """Dispatch a DATA_DISCONNECTED / DATA_RECONNECTED alert for `ticker`.
+
+        Used by the data pipeline's reconnection state machine, which has no
+        TradeSignal of its own — this synthesizes one so data-integrity events
+        flow through the exact same sink fan-out as trade alerts.
+        """
+        await self.notify_signal(
+            TradeSignal(
+                engine="data_pipeline",
+                symbol=ticker,
+                action=action,
+                price=0.0,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        )

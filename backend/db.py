@@ -14,12 +14,12 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-from sqlalchemy import Float, String, select
+from sqlalchemy import Float, String, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import StaticPool
 
-from backend.models import TradeRecord
+from backend.models import OpenPositionRecord, TradeRecord
 
 DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./traderz.db"
 
@@ -41,6 +41,33 @@ class Trade(Base):
     position_size: Mapped[float] = mapped_column(Float)
     fees: Mapped[float] = mapped_column(Float)
     net_profit: Mapped[float] = mapped_column(Float)
+    # Phase 3 slippage tracking: what the engine asked for vs. what the gateway
+    # actually filled at the entry, plus the combined entry+exit dollar cost.
+    requested_price: Mapped[float] = mapped_column(Float, default=0.0)
+    actual_filled_price: Mapped[float] = mapped_column(Float, default=0.0)
+    slippage_cost: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class OpenPosition(Base):
+    """A live position awaiting its close, persisted the moment the entry fills.
+
+    This is the database side of crash recovery: `backend/reconciliation.py`
+    diffs these rows against the gateway's open orders at boot and self-heals
+    whichever side is missing a record.
+    """
+
+    __tablename__ = "open_positions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    engine_type: Mapped[str] = mapped_column(String(32), index=True)
+    asset_ticker: Mapped[str] = mapped_column(String(16))
+    side: Mapped[str] = mapped_column(String(8))
+    entry_timestamp: Mapped[datetime] = mapped_column()
+    entry_price: Mapped[float] = mapped_column(Float)
+    requested_entry_price: Mapped[float] = mapped_column(Float)
+    position_size: Mapped[float] = mapped_column(Float)
+    entry_fees: Mapped[float] = mapped_column(Float)
+    entry_order_id: Mapped[str] = mapped_column(String(64), index=True)
 
 
 class EquitySnapshot(Base):
@@ -88,9 +115,65 @@ class Database:
                     position_size=trade.position_size,
                     fees=trade.fees,
                     net_profit=trade.net_profit,
+                    requested_price=trade.requested_price,
+                    actual_filled_price=trade.actual_filled_price,
+                    slippage_cost=trade.slippage_cost,
                 )
             )
             await session.commit()
+
+    async def record_open_position(self, position: OpenPositionRecord) -> None:
+        async with self._session_factory() as session:
+            session.add(
+                OpenPosition(
+                    engine_type=position.engine_type,
+                    asset_ticker=position.asset_ticker,
+                    side=position.side,
+                    entry_timestamp=position.entry_timestamp,
+                    entry_price=position.entry_price,
+                    requested_entry_price=position.requested_entry_price,
+                    position_size=position.position_size,
+                    entry_fees=position.entry_fees,
+                    entry_order_id=position.entry_order_id,
+                )
+            )
+            await session.commit()
+
+    async def clear_open_position(self, engine_type: str, asset_ticker: str) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                delete(OpenPosition)
+                .where(OpenPosition.engine_type == engine_type)
+                .where(OpenPosition.asset_ticker == asset_ticker)
+            )
+            await session.commit()
+
+    async def list_open_positions(self, engine_type: str | None = None) -> list[OpenPositionRecord]:
+        async with self._session_factory() as session:
+            query = select(OpenPosition).order_by(OpenPosition.entry_timestamp)
+            if engine_type is not None:
+                query = query.where(OpenPosition.engine_type == engine_type)
+            result = await session.execute(query)
+            return [
+                OpenPositionRecord(
+                    engine_type=row.engine_type,
+                    asset_ticker=row.asset_ticker,
+                    side=row.side,
+                    entry_timestamp=row.entry_timestamp,
+                    entry_price=row.entry_price,
+                    requested_entry_price=row.requested_entry_price,
+                    position_size=row.position_size,
+                    entry_fees=row.entry_fees,
+                    entry_order_id=row.entry_order_id,
+                )
+                for row in result.scalars().all()
+            ]
+
+    async def total_slippage_cost(self) -> float:
+        """Cumulative dollars lost to slippage across all closed trades."""
+        async with self._session_factory() as session:
+            result = await session.execute(select(func.coalesce(func.sum(Trade.slippage_cost), 0.0)))
+            return float(result.scalar_one())
 
     async def record_equity_snapshot(self, engine_type: str, timestamp: datetime, equity: float) -> None:
         async with self._session_factory() as session:

@@ -10,13 +10,19 @@ be driven by separate `asyncio` tasks.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 import numpy as np
 import pandas as pd
 
-from backend.models import OHLCVBar, Timeframe
+from backend.models import OHLCVBar, SignalAction, Timeframe
+from backend.notifier import Notifier
+from backend.risk_manager import RiskManager
+
+logger = logging.getLogger("traderz.data_pipeline")
 
 MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 30
@@ -113,6 +119,159 @@ async def stream_4h_bars(
         timestamp += timedelta(hours=4)
         count += 1
         await asyncio.sleep(interval_seconds)
+
+
+class StreamDisconnected(Exception):
+    """Raised by a live/simulated feed when its connection drops mid-stream."""
+
+
+class StreamState(str, Enum):
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    RECONNECTING = "reconnecting"
+    VERIFYING = "verifying"
+
+
+async def flaky_stream(
+    base: AsyncIterator[OHLCVBar],
+    *,
+    drop_after: list[int],
+) -> AsyncIterator[OHLCVBar]:
+    """Test/simulation wrapper: raises `StreamDisconnected` after yielding the
+    bar counts listed in `drop_after` (cumulative across reconnects is up to the
+    caller — each `flaky_stream` instance counts its own yields)."""
+    schedule = list(drop_after)
+    count = 0
+    async for bar in base:
+        yield bar
+        count += 1
+        if schedule and count >= schedule[0]:
+            schedule.pop(0)
+            raise StreamDisconnected(f"simulated drop after {count} bars")
+
+
+class ResilientStream:
+    """Reconnection state machine wrapping a raw OHLCV stream.
+
+    States: CONNECTED -> DISCONNECTED (drop detected) -> RECONNECTING
+    (exponential backoff: 2s, 4s, 8s, ... capped at 64s) -> VERIFYING (a fresh
+    stream must deliver `verify_bars` clean bars before it is trusted) ->
+    CONNECTED. On every drop the notifier is alerted and the shared
+    `RiskManager` marks the ticker DATA_DISCONNECTED so engines stop evaluating
+    it; both are reversed only after verification passes. The backoff delay
+    resets only after a *verified* reconnection — a stream that keeps dying
+    during verification keeps backing off further, it does not get a fresh 2s.
+
+    `backoff_scale` exists for tests: it multiplies every delay so a suite can
+    exercise the full 2->64 progression in milliseconds of wall-clock time.
+    """
+
+    def __init__(
+        self,
+        stream_factory: Callable[[], AsyncIterator[OHLCVBar]],
+        ticker: str,
+        *,
+        risk_manager: RiskManager | None = None,
+        notifier: Notifier | None = None,
+        backoff_initial: float = 2.0,
+        backoff_max: float = 64.0,
+        backoff_factor: float = 2.0,
+        backoff_scale: float = 1.0,
+        verify_bars: int = 1,
+        max_retries: int | None = None,
+    ) -> None:
+        self._stream_factory = stream_factory
+        self.ticker = ticker
+        self._risk_manager = risk_manager
+        self._notifier = notifier
+        self.backoff_initial = backoff_initial
+        self.backoff_max = backoff_max
+        self.backoff_factor = backoff_factor
+        self.backoff_scale = backoff_scale
+        self.verify_bars = verify_bars
+        self.max_retries = max_retries
+
+        self.state: StreamState = StreamState.CONNECTED
+        self.disconnect_count = 0
+        self.reconnect_attempts = 0
+        self._current_backoff = backoff_initial
+        self.delays_used: list[float] = []
+
+    def _next_delay(self) -> float:
+        delay = self._current_backoff
+        self._current_backoff = min(self._current_backoff * self.backoff_factor, self.backoff_max)
+        self.delays_used.append(delay)
+        return delay * self.backoff_scale
+
+    def _reset_backoff(self) -> None:
+        self._current_backoff = self.backoff_initial
+
+    async def _on_disconnect(self, exc: StreamDisconnected) -> None:
+        self.state = StreamState.DISCONNECTED
+        self.disconnect_count += 1
+        logger.warning("data stream for %s disconnected: %s", self.ticker, exc)
+        if self._risk_manager is not None:
+            self._risk_manager.mark_data_disconnected(self.ticker)
+        if self._notifier is not None:
+            await self._notifier.notify_data_event(
+                SignalAction.DATA_DISCONNECTED,
+                self.ticker,
+                datetime.now(timezone.utc),
+                f"stream_disconnected: {exc}",
+            )
+
+    async def _on_verified(self) -> None:
+        self.state = StreamState.CONNECTED
+        self._reset_backoff()
+        logger.info("data stream for %s reconnected and verified", self.ticker)
+        if self._risk_manager is not None:
+            self._risk_manager.mark_data_verified(self.ticker)
+        if self._notifier is not None:
+            await self._notifier.notify_data_event(
+                SignalAction.DATA_RECONNECTED,
+                self.ticker,
+                datetime.now(timezone.utc),
+                f"stream_verified_after_{self.disconnect_count}_disconnects",
+            )
+
+    async def bars(self) -> AsyncIterator[OHLCVBar]:
+        """Yields bars from the wrapped stream, reconnecting transparently.
+
+        Unverified bars are never yielded: after a reconnect, the first
+        `verify_bars` bars are buffered, and only once they all arrive cleanly
+        (verification passes) are they released downstream.
+        """
+        retries = 0
+        needs_verification = False
+        while True:
+            stream = self._stream_factory()
+            pending: list[OHLCVBar] = []
+            verified_count = 0
+            try:
+                async for bar in stream:
+                    if needs_verification:
+                        pending.append(bar)
+                        verified_count += 1
+                        if verified_count >= self.verify_bars:
+                            await self._on_verified()
+                            needs_verification = False
+                            retries = 0
+                            for buffered in pending:
+                                yield buffered
+                            pending = []
+                        continue
+                    yield bar
+                return  # underlying stream finished normally (bounded runs)
+            except StreamDisconnected as exc:
+                await self._on_disconnect(exc)
+                retries += 1
+                if self.max_retries is not None and retries > self.max_retries:
+                    raise
+                self.state = StreamState.RECONNECTING
+                self.reconnect_attempts += 1
+                await asyncio.sleep(self._next_delay())
+                self.state = StreamState.VERIFYING
+                needs_verification = True
 
 
 def bars_to_dataframe(bars: list[OHLCVBar]) -> pd.DataFrame:

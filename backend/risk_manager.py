@@ -45,6 +45,10 @@ class RiskManager:
         self._halted: bool = False
         self._halted_reason: str | None = None
         self._paused: bool = False
+        # Tickers whose live data stream is currently down (set by the data
+        # pipeline's reconnection state machine, cleared once integrity is
+        # re-verified). Engines must not evaluate bars for a broken ticker.
+        self._disconnected_tickers: set[str] = set()
 
     def _roll_day(self, timestamp: datetime) -> None:
         today = timestamp.date()
@@ -61,9 +65,28 @@ class RiskManager:
     def compute_fees(self, notional: float) -> float:
         return abs(notional) * self.fee_rate
 
-    def can_open_position(self, timestamp: datetime) -> bool:
+    def can_open_position(self, timestamp: datetime, ticker: str | None = None) -> bool:
         self._roll_day(timestamp)
+        if ticker is not None and ticker in self._disconnected_tickers:
+            return False
         return not (self._halted or self._paused)
+
+    def mark_data_disconnected(self, ticker: str) -> None:
+        """Flag `ticker`'s stream as down: engines must stop evaluating it."""
+        self._disconnected_tickers.add(ticker)
+
+    def mark_data_verified(self, ticker: str) -> None:
+        """Clear the disconnection flag once the stream's integrity is verified."""
+        self._disconnected_tickers.discard(ticker)
+
+    def is_data_disconnected(self, ticker: str | None = None) -> bool:
+        if ticker is not None:
+            return ticker in self._disconnected_tickers
+        return bool(self._disconnected_tickers)
+
+    @property
+    def disconnected_tickers(self) -> list[str]:
+        return sorted(self._disconnected_tickers)
 
     def is_halted(self, timestamp: datetime | None = None) -> bool:
         if timestamp is not None:
@@ -97,6 +120,8 @@ class RiskManager:
             self._roll_day(timestamp)
         if self._halted:
             return "HALTED_BY_DRAWDOWN"
+        if self._disconnected_tickers:
+            return "DATA_DISCONNECTED"
         if self._paused:
             return "PAUSED"
         return "RUNNING"
@@ -110,6 +135,8 @@ class RiskManager:
             "halted": self._halted,
             "halted_reason": self._halted_reason,
             "paused": self._paused,
+            "data_disconnected": bool(self._disconnected_tickers),
+            "disconnected_tickers": self.disconnected_tickers,
             "daily_pnl": round(self._daily_pnl, 4),
             "daily_drawdown_pct": round(daily_drawdown_pct, 6),
             "max_daily_drawdown_pct": self.max_daily_drawdown_pct,
