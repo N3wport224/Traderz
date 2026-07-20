@@ -76,6 +76,13 @@ export interface RiskStatus {
 
 export type GatewayMode = "mock" | "live";
 
+export type DataSourceMode = "mock" | "live";
+
+export interface WatchlistState {
+  ticker: string;
+  data_source_mode: DataSourceMode;
+}
+
 export type StreamState = "connected" | "disconnected" | "reconnecting" | "verifying";
 
 export interface StreamStatus {
@@ -113,6 +120,8 @@ export interface TelemetryStats {
   system_status: SystemStatus;
   data_disconnected: boolean;
   disconnected_tickers: string[];
+  ticker: string;
+  data_source_mode: DataSourceMode;
   streams: Record<string, StreamStatus>;
   boot_reconciliation: {
     matched: string[];

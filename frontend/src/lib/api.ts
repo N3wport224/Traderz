@@ -8,6 +8,7 @@ import type {
   TelemetryStats,
   Trade,
   TradeSignal,
+  WatchlistState,
 } from "./types";
 
 export const API_BASE_URL: string = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -76,6 +77,25 @@ export async function fetchRiskStatus(): Promise<RiskStatus> {
 
 export async function fetchTelemetry(): Promise<TelemetryStats> {
   return getJson<TelemetryStats>("/api/telemetry");
+}
+
+export async function fetchWatchlist(): Promise<WatchlistState> {
+  return getJson<WatchlistState>("/api/watchlist");
+}
+
+export async function updateWatchlist(ticker: string): Promise<WatchlistState> {
+  const response = await fetch(`${API_BASE_URL}/api/watchlist`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticker }),
+  });
+  if (!response.ok) {
+    if (response.status === 422) {
+      throw new Error("Invalid ticker — use a stock symbol (AAPL) or crypto pair (BTC/USDT)");
+    }
+    throw new Error(`Watchlist update failed with status ${response.status}`);
+  }
+  return (await response.json()) as WatchlistState;
 }
 
 export async function pauseSystem(): Promise<RiskStatus> {
