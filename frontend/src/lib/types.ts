@@ -39,6 +39,28 @@ export interface Trade {
   requested_price: number;
   actual_filled_price: number;
   slippage_cost: number;
+  stop_loss_price: number;
+  take_profit_price: number;
+  bracket_status: BracketStatus | "";
+}
+
+export type BracketStatus = "ACTIVE" | "HIT_SL" | "HIT_TP" | "TIME_EXITED";
+
+export interface BracketCard {
+  order_id: string;
+  engine_type: string;
+  ticker: string;
+  side: "long" | "short";
+  status: BracketStatus;
+  entry_price: number;
+  current_price: number;
+  stop_loss_price: number;
+  take_profit_price: number;
+  tp_distance_pct: number;
+  sl_distance_pct: number;
+  risk_reward_ratio: number | null;
+  unrealized_pct: number;
+  created_at: string;
 }
 
 export interface MomentumConfig {

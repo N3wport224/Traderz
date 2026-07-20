@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 
+import ActiveTargetSignals from "@/components/ActiveTargetSignals";
 import AssetSelector from "@/components/AssetSelector";
 import DataDisconnectedBanner from "@/components/DataDisconnectedBanner";
 import EnginePanel from "@/components/EnginePanel";
@@ -10,6 +11,7 @@ import RiskControlsModal from "@/components/RiskControlsModal";
 import SystemStatusBadge from "@/components/SystemStatusBadge";
 import TelemetryBar from "@/components/TelemetryBar";
 import TradesTable from "@/components/TradesTable";
+import { useBrackets } from "@/hooks/useBrackets";
 import { useEngineFeed } from "@/hooks/useEngineFeed";
 import { useRiskStatus } from "@/hooks/useRiskStatus";
 import { useTelemetry } from "@/hooks/useTelemetry";
@@ -21,6 +23,7 @@ import { useWatchlist } from "@/hooks/useWatchlist";
 function AssetDashboard({ ticker }: { ticker: string }) {
   const momentum = useEngineFeed("momentum");
   const swing = useEngineFeed("swing");
+  const brackets = useBrackets();
 
   return (
     <>
@@ -42,6 +45,8 @@ function AssetDashboard({ ticker }: { ticker: string }) {
       </div>
 
       <EquityChart momentumEquity={momentum.equityCurve} swingEquity={swing.equityCurve} />
+
+      <ActiveTargetSignals brackets={brackets} />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <TradesTable title={`Momentum Engine — Trade History · ${ticker}`} trades={momentum.trades} />

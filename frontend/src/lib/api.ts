@@ -1,4 +1,5 @@
 import type {
+  BracketCard,
   EngineChannel,
   EquityPoint,
   MomentumConfig,
@@ -77,6 +78,10 @@ export async function fetchRiskStatus(): Promise<RiskStatus> {
 
 export async function fetchTelemetry(): Promise<TelemetryStats> {
   return getJson<TelemetryStats>("/api/telemetry");
+}
+
+export async function fetchBrackets(): Promise<BracketCard[]> {
+  return getJson<BracketCard[]>("/api/brackets");
 }
 
 export async function fetchWatchlist(): Promise<WatchlistState> {
