@@ -80,6 +80,17 @@ export interface StrategyConfig {
 
 export type SystemStatus = "RUNNING" | "PAUSED" | "HALTED_BY_DRAWDOWN" | "DATA_DISCONNECTED";
 
+export interface RiskGuardStatus {
+  locked: boolean;
+  locked_reason: string | null;
+  circuit_breaker_active: boolean;
+  daily_realized_pnl: number;
+  daily_entry_count: number;
+  max_daily_loss_pct: number;
+  max_daily_trade_count: number;
+  current_date: string | null;
+}
+
 export interface RiskStatus {
   system_status: SystemStatus;
   halted: boolean;
@@ -94,6 +105,33 @@ export interface RiskStatus {
   allocation_pct: Record<string, number>;
   fee_rate: number;
   current_date: string | null;
+  risk_guard: RiskGuardStatus;
+}
+
+export interface BacktestRequest {
+  symbol: string;
+  strategy: "momentum" | "swing";
+  start_date: string;
+  end_date: string;
+  initial_capital: number;
+}
+
+export interface BacktestReport {
+  strategy: string;
+  symbol: string;
+  start_time: string;
+  end_time: string;
+  initial_capital: number;
+  bars_replayed: number;
+  trade_count: number;
+  net_pnl: number;
+  total_return_pct: number;
+  win_rate_pct: number | null;
+  profit_factor: number | "inf" | null;
+  max_drawdown_pct: number;
+  bracket_outcomes: Record<string, number>;
+  equity_curve: { timestamp: string; equity: number }[];
+  risk_guard: RiskGuardStatus | null;
 }
 
 export type GatewayMode = "mock" | "live";
@@ -144,6 +182,7 @@ export interface TelemetryStats {
   disconnected_tickers: string[];
   ticker: string;
   data_source_mode: DataSourceMode;
+  risk_guard: RiskGuardStatus;
   streams: Record<string, StreamStatus>;
   boot_reconciliation: {
     matched: string[];

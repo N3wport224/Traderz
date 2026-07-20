@@ -4,10 +4,12 @@ import { useState } from "react";
 
 import ActiveTargetSignals from "@/components/ActiveTargetSignals";
 import AssetSelector from "@/components/AssetSelector";
+import BacktestPanel from "@/components/BacktestPanel";
 import DataDisconnectedBanner from "@/components/DataDisconnectedBanner";
 import EnginePanel from "@/components/EnginePanel";
 import EquityChart from "@/components/EquityChart";
 import RiskControlsModal from "@/components/RiskControlsModal";
+import SystemHealth from "@/components/SystemHealth";
 import SystemStatusBadge from "@/components/SystemStatusBadge";
 import TelemetryBar from "@/components/TelemetryBar";
 import TradesTable from "@/components/TradesTable";
@@ -56,14 +58,23 @@ function AssetDashboard({ ticker }: { ticker: string }) {
   );
 }
 
+type DashboardView = "live" | "analytics";
+
+const TAB_LABELS: Record<DashboardView, string> = {
+  live: "Live Trading",
+  analytics: "Strategy Analytics & Backtesting",
+};
+
 export default function Dashboard() {
   const risk = useRiskStatus();
   const { telemetry, unreachable } = useTelemetry();
   const watchlist = useWatchlist();
   const [riskModalOpen, setRiskModalOpen] = useState(false);
+  const [view, setView] = useState<DashboardView>("live");
 
   const dataDisconnected = telemetry?.data_disconnected ?? risk.status?.data_disconnected ?? false;
   const activeTicker = watchlist.ticker ?? telemetry?.ticker ?? null;
+  const guard = telemetry?.risk_guard ?? risk.status?.risk_guard ?? null;
 
   return (
     <div className="min-h-screen bg-black text-zinc-100">
@@ -85,12 +96,18 @@ export default function Dashboard() {
           />
         )}
 
-        <header className="flex items-start justify-between gap-4">
+        <header className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <h1 className="text-lg font-semibold tracking-tight text-zinc-100">Traderz</h1>
             <p className="text-sm text-zinc-500">Multi-engine algorithmic trading dashboard</p>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <SystemHealth
+              guard={guard}
+              onKill={risk.kill}
+              onReset={risk.resetGuard}
+              actionPending={risk.actionPending}
+            />
             <SystemStatusBadge status={risk.status?.system_status ?? null} />
             <button
               onClick={() => setRiskModalOpen(true)}
@@ -101,7 +118,27 @@ export default function Dashboard() {
           </div>
         </header>
 
-        {activeTicker && <AssetDashboard key={activeTicker} ticker={activeTicker} />}
+        <nav className="flex gap-1 border-b border-zinc-800">
+          {(Object.keys(TAB_LABELS) as DashboardView[]).map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setView(tab)}
+              className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
+                view === tab
+                  ? "border-sky-400 text-sky-300"
+                  : "border-transparent text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              {TAB_LABELS[tab]}
+            </button>
+          ))}
+        </nav>
+
+        {view === "live" ? (
+          activeTicker && <AssetDashboard key={activeTicker} ticker={activeTicker} />
+        ) : (
+          <BacktestPanel />
+        )}
       </main>
 
       <RiskControlsModal open={riskModalOpen} onClose={() => setRiskModalOpen(false)} risk={risk} />

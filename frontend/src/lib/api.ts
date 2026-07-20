@@ -1,4 +1,6 @@
 import type {
+  BacktestReport,
+  BacktestRequest,
   BracketCard,
   EngineChannel,
   EquityPoint,
@@ -82,6 +84,33 @@ export async function fetchTelemetry(): Promise<TelemetryStats> {
 
 export async function fetchBrackets(): Promise<BracketCard[]> {
   return getJson<BracketCard[]>("/api/brackets");
+}
+
+export async function runBacktest(request: BacktestRequest): Promise<BacktestReport> {
+  const response = await fetch(`${API_BASE_URL}/api/backtest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    let detail = `status ${response.status}`;
+    try {
+      const body = (await response.json()) as { detail?: unknown };
+      if (body.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+    } catch {
+      // keep the status-based message
+    }
+    throw new Error(`Backtest failed: ${detail}`);
+  }
+  return (await response.json()) as BacktestReport;
+}
+
+export async function engageKillSwitch(): Promise<RiskStatus> {
+  return postJson<RiskStatus>("/api/system/kill");
+}
+
+export async function resetRiskGuard(): Promise<RiskStatus> {
+  return postJson<RiskStatus>("/api/system/guard/reset");
 }
 
 export async function fetchWatchlist(): Promise<WatchlistState> {
