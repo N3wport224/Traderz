@@ -1,9 +1,16 @@
 """Swing Trading Engine — macro trendline strategy, "Tori Trades" style.
 
 Listens to the 4-hour bar stream, detects peak/trough pivots with a rolling
-window, fits ascending (support) trendlines that connect at least 3
-historically-verified pivot touches, and alerts when price retraces to
-within 0.5% of a valid trendline alongside a bullish engulfing candle.
+window, fits ascending (support) trendlines that connect at least N
+historically-verified pivot touches (N and the retest proximity tolerance are
+both live-configurable), and alerts when price retraces to within tolerance
+of a valid trendline alongside a bullish engulfing candle. Position size is
+capped by the shared `RiskManager`'s capital allocation limit for this
+engine, and every closed (hypothetical) trade is written through the
+injected `TradePersistence`. The engine depends only on `backend/models.py`
+(for the injected protocol) plus the standalone `backend/config.py` /
+`backend/risk_manager.py` collaborators — never on `backend/db.py`,
+`backend/main.py`, or the momentum engine.
 """
 
 from __future__ import annotations
@@ -15,18 +22,21 @@ from itertools import combinations
 
 import pandas as pd
 
-from backend.models import OHLCVBar, SignalAction, TradeSignal
+from backend.config import ConfigStore
+from backend.models import NullPersistence, OHLCVBar, SignalAction, TradePersistence, TradeRecord, TradeSignal
+from backend.risk_manager import RiskManager
 
-PIVOT_WINDOW = 5  # bars on each side required to confirm a pivot
-MIN_TOUCHES = 3
-TOUCH_TOLERANCE_PCT = 0.005  # 0.5%
+PIVOT_WINDOW = 5  # bars on each side required to confirm a pivot; not live-configurable
 HOLD_PERIOD_BARS = 3  # bars held after an alert, for equity/performance tracking
+MAX_BAR_HISTORY = 200  # bounds the rolling buffer so pivot/trendline recomputation stays O(1)-ish per bar
 
 
 @dataclass(slots=True)
 class _OpenPosition:
     entry_price: float
-    entry_index: int
+    entry_bar_count: int
+    entry_timestamp: datetime
+    notional: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,27 +63,45 @@ class SwingEngine:
     """Trendline-based macro swing-trading engine driven by 4-hour bars."""
 
     name = "swing_engine"
+    ENGINE_TYPE = "swing"
 
     def __init__(
         self,
         symbol: str,
+        *,
         pivot_window: int = PIVOT_WINDOW,
-        min_touches: int = MIN_TOUCHES,
-        touch_tolerance_pct: float = TOUCH_TOLERANCE_PCT,
         hold_period_bars: int = HOLD_PERIOD_BARS,
+        max_bar_history: int = MAX_BAR_HISTORY,
+        config_store: ConfigStore | None = None,
+        risk_manager: RiskManager | None = None,
+        persistence: TradePersistence | None = None,
+        starting_equity: float = 0.0,
     ) -> None:
         self.symbol = symbol
         self.pivot_window = pivot_window
-        self.min_touches = min_touches
-        self.touch_tolerance_pct = touch_tolerance_pct
         self.hold_period_bars = hold_period_bars
+        self.max_bar_history = max_bar_history
+        self._config_store = config_store or ConfigStore()
+        self._risk_manager = risk_manager or RiskManager()
+        self._persistence = persistence or NullPersistence()
 
         self._bars: list[OHLCVBar] = []
+        self._bar_count: int = 0
         self.signals: list[TradeSignal] = []
-        self.equity: float = 0.0
+        self.equity: float = starting_equity
         self.equity_curve: list[tuple[datetime, float]] = []
         self._alerted_lines: set[tuple[float, float]] = set()
         self._position: _OpenPosition | None = None
+
+    @property
+    def min_touches(self) -> int:
+        """Live minimum trendline touchpoints required, read from config."""
+        return self._config_store.swing.min_touches
+
+    @property
+    def touch_tolerance_pct(self) -> float:
+        """Live bounce/retest proximity tolerance, read from config."""
+        return self._config_store.swing.touch_tolerance_pct
 
     def to_dataframe(self) -> pd.DataFrame:
         records = [
@@ -115,6 +143,8 @@ class SwingEngine:
 
     def _fit_trendline(self, pivots: list[Pivot], kind: str) -> Trendline | None:
         """Finds the best-fit line through any two pivots that at least `min_touches` pivots touch."""
+        min_touches = self.min_touches
+        tolerance = self.touch_tolerance_pct
         best: Trendline | None = None
         for p1, p2 in combinations(pivots, 2):
             if p1.index == p2.index:
@@ -127,10 +157,10 @@ class SwingEngine:
                 predicted = slope * p.index + intercept
                 if predicted == 0:
                     continue
-                if abs(p.price - predicted) / abs(predicted) <= self.touch_tolerance_pct:
+                if abs(p.price - predicted) / abs(predicted) <= tolerance:
                     touching.append(p)
 
-            if len(touching) >= self.min_touches and (best is None or len(touching) > best.touches):
+            if len(touching) >= min_touches and (best is None or len(touching) > best.touches):
                 best = Trendline(kind, slope, intercept, len(touching), touching)
         return best
 
@@ -172,69 +202,111 @@ class SwingEngine:
         self.signals.append(signal)
         return signal
 
-    def _close_position(self, bar: OHLCVBar, reason: str) -> TradeSignal:
+    async def _close_position(self, bar: OHLCVBar, reason: str) -> list[TradeSignal]:
         position = self._position
         assert position is not None
-        pnl = bar.close - position.entry_price
-        self.equity += pnl
+        pct_move = (bar.close - position.entry_price) / position.entry_price
+        gross_pnl = pct_move * position.notional
+        fees = self._risk_manager.compute_fees(position.notional)
+        net_pnl = gross_pnl - fees
+
+        self.equity += net_pnl
         self.equity_curve.append((bar.timestamp, self.equity))
         self._position = None
-        return self._emit(SignalAction.EXIT, bar.close, bar.timestamp, reason, pnl=round(pnl, 4))
 
-    async def on_bar(self, bar: OHLCVBar) -> TradeSignal | None:
-        """Feeds a single 4-hour bar to the engine, returning a signal if one fires.
+        signals = [self._emit(SignalAction.EXIT, bar.close, bar.timestamp, reason, pnl=round(net_pnl, 4), fees=round(fees, 4))]
+
+        await self._persistence.record_trade(
+            TradeRecord(
+                engine_type=self.ENGINE_TYPE,
+                asset_ticker=self.symbol,
+                entry_timestamp=position.entry_timestamp,
+                exit_timestamp=bar.timestamp,
+                entry_price=position.entry_price,
+                exit_price=bar.close,
+                position_size=position.notional,
+                fees=fees,
+                net_profit=net_pnl,
+            )
+        )
+        await self._persistence.record_equity_snapshot(self.ENGINE_TYPE, bar.timestamp, self.equity)
+
+        if self._risk_manager.record_realized_pnl(self.ENGINE_TYPE, net_pnl, bar.timestamp):
+            signals.append(
+                self._emit(SignalAction.CIRCUIT_BREAKER, bar.close, bar.timestamp, "max_daily_drawdown_exceeded")
+            )
+        return signals
+
+    async def on_bar(self, bar: OHLCVBar) -> list[TradeSignal]:
+        """Feeds a single 4-hour bar to the engine, returning any signals that fired.
 
         A trendline-retest alert opens a hypothetical position (for equity/performance
         tracking); it is marked to market and closed automatically after a fixed
         holding period so the strategy's equity curve stays bounded and observable.
         """
         self._bars.append(bar)
+        self._bar_count += 1
+        if len(self._bars) > self.max_bar_history:
+            # Bound the buffer so pivot/trendline recomputation stays cheap per bar.
+            # Safe to trim from the front: pivot/trendline indices are local to each
+            # call and never compared across calls, and hold-period tracking uses
+            # `_bar_count` (a monotonic counter), not a list index.
+            self._bars = self._bars[-self.max_bar_history :]
+
+        if not self._risk_manager.can_open_position(bar.timestamp):
+            if self._position is not None:
+                return await self._close_position(bar, "circuit_breaker_active")
+            return []
 
         if self._position is not None:
-            current_index = len(self._bars) - 1
-            if current_index - self._position.entry_index >= self.hold_period_bars:
-                return self._close_position(bar, f"hold_period_{self.hold_period_bars}_bars")
-            return None
+            if self._bar_count - self._position.entry_bar_count >= self.hold_period_bars:
+                return await self._close_position(bar, f"hold_period_{self.hold_period_bars}_bars")
+            return []
 
         span = 2 * self.pivot_window + 1
         if len(self._bars) < span:
-            return None
+            return []
 
         line = self.find_support_trendline()
         if line is None or line.slope <= 0:
-            return None  # only ascending (bullish) support trendlines are tradeable here
+            return []  # only ascending (bullish) support trendlines are tradeable here
 
         current_index = len(self._bars) - 1
         line_value = line.value_at(current_index)
         if line_value <= 0:
-            return None
+            return []
 
         distance_pct = abs(bar.close - line_value) / line_value
         if distance_pct > self.touch_tolerance_pct:
-            return None
+            return []
 
         previous_bar = self._bars[-2]
         if not self.is_bullish_engulfing(previous_bar, bar):
-            return None
+            return []
 
         line_key = (round(line.slope, 6), round(line.intercept, 6))
         if line_key in self._alerted_lines:
-            return None
+            return []
         self._alerted_lines.add(line_key)
-        self._position = _OpenPosition(entry_price=bar.close, entry_index=current_index)
-
-        return self._emit(
-            SignalAction.ALERT,
-            bar.close,
-            bar.timestamp,
-            "trendline_retest_bullish_engulfing",
-            trendline_slope=line.slope,
-            trendline_touches=line.touches,
+        notional = self._risk_manager.position_size(self.ENGINE_TYPE)
+        self._position = _OpenPosition(
+            entry_price=bar.close, entry_bar_count=self._bar_count, entry_timestamp=bar.timestamp, notional=notional
         )
+
+        return [
+            self._emit(
+                SignalAction.ALERT,
+                bar.close,
+                bar.timestamp,
+                "trendline_retest_bullish_engulfing",
+                trendline_slope=line.slope,
+                trendline_touches=line.touches,
+                position_size=notional,
+            )
+        ]
 
     async def run(self, bar_stream: AsyncIterator[OHLCVBar]) -> AsyncIterator[TradeSignal]:
         """Consumes a 4-hour bar stream indefinitely, yielding signals as they fire."""
         async for bar in bar_stream:
-            signal = await self.on_bar(bar)
-            if signal is not None:
+            for signal in await self.on_bar(bar):
                 yield signal
