@@ -5,6 +5,7 @@ import type {
   EngineChannel,
   EquityPoint,
   MomentumConfig,
+  NotifierPingResult,
   RiskStatus,
   StrategyConfig,
   SwingConfig,
@@ -130,6 +131,10 @@ export async function updateWatchlist(ticker: string): Promise<WatchlistState> {
     throw new Error(`Watchlist update failed with status ${response.status}`);
   }
   return (await response.json()) as WatchlistState;
+}
+
+export async function testNotifierWebhook(): Promise<NotifierPingResult> {
+  return postJson<NotifierPingResult>("/api/system/notifier/test");
 }
 
 export async function pauseSystem(): Promise<RiskStatus> {

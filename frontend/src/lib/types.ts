@@ -154,7 +154,43 @@ export interface BacktestReport {
   risk_guard: RiskGuardStatus | null;
 }
 
-export type GatewayMode = "mock" | "live";
+export type GatewayMode = "mock" | "live" | "prod_live";
+
+export interface GatewayMetadata {
+  provider: string;
+  broker_url: string;
+  exit_retry_attempts: number;
+  risk_manager_attached: boolean;
+}
+
+export interface GatewayInfo {
+  name: string;
+  mode: GatewayMode;
+  provider: string;
+  metadata: GatewayMetadata | null;
+}
+
+export interface NotifierEvent {
+  timestamp: string;
+  level: "ALERT" | "INFO";
+  title: string;
+  message: string;
+  context: Record<string, unknown>;
+  delivered: boolean;
+}
+
+export interface NotifierStatus {
+  configured: boolean;
+  delivered_count: number;
+  failed_count: number;
+  recent_events: NotifierEvent[];
+}
+
+export interface NotifierPingResult {
+  configured: boolean;
+  delivered: boolean;
+  detail: string;
+}
 
 export type DataSourceMode = "mock" | "live";
 
@@ -196,7 +232,8 @@ export interface TelemetryStats {
   avg_gateway_latency_ms: number;
   connection_latency_ms: number;
   last_flow: OrderFlow | null;
-  gateway: { name: string; mode: GatewayMode };
+  gateway: GatewayInfo;
+  notifier: NotifierStatus;
   system_status: SystemStatus;
   data_disconnected: boolean;
   disconnected_tickers: string[];

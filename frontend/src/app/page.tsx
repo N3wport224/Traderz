@@ -108,6 +108,8 @@ export default function Dashboard() {
               dbMode={telemetry?.database?.journal_mode ?? null}
               transport={telemetry?.transport ?? null}
               streamLatencyMs={telemetry?.stream_latency_ms ?? null}
+              gateway={telemetry?.gateway ?? null}
+              notifier={telemetry?.notifier ?? null}
               onKill={risk.kill}
               onReset={risk.resetGuard}
               actionPending={risk.actionPending}

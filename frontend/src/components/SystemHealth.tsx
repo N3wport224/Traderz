@@ -1,6 +1,9 @@
 "use client";
 
-import type { RiskGuardStatus, RiskGuardSync } from "@/lib/types";
+import { useState } from "react";
+
+import ExecutionSettingsModal from "@/components/ExecutionSettingsModal";
+import type { GatewayInfo, NotifierStatus, RiskGuardStatus, RiskGuardSync } from "@/lib/types";
 
 function latencyTone(ms: number): string {
   if (ms <= 50) return "text-emerald-400";
@@ -25,6 +28,8 @@ interface SystemHealthProps {
   dbMode: string | null;
   transport: "rest" | "websocket" | null;
   streamLatencyMs: number | null;
+  gateway: GatewayInfo | null;
+  notifier: NotifierStatus | null;
   onKill: () => Promise<void>;
   onReset: () => Promise<void>;
   actionPending: boolean;
@@ -38,10 +43,13 @@ export default function SystemHealth({
   dbMode,
   transport,
   streamLatencyMs,
+  gateway,
+  notifier,
   onKill,
   onReset,
   actionPending,
 }: SystemHealthProps) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const locked = guard?.locked ?? false;
   const synced = sync?.in_sync ?? true;
 
@@ -137,6 +145,30 @@ export default function SystemHealth({
           </button>
         </>
       )}
+
+      {/* execution settings cog: provider metadata + webhook connectivity test */}
+      <button
+        onClick={() => setSettingsOpen(true)}
+        aria-label="Execution settings"
+        title="Execution provider & alert webhook settings"
+        className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4">
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M10.34 3.94a1.7 1.7 0 0 1 3.32 0l.16.72a1.7 1.7 0 0 0 2.5 1.04l.63-.38a1.7 1.7 0 0 1 2.35 2.35l-.38.63a1.7 1.7 0 0 0 1.04 2.5l.72.16a1.7 1.7 0 0 1 0 3.32l-.72.16a1.7 1.7 0 0 0-1.04 2.5l.38.63a1.7 1.7 0 0 1-2.35 2.35l-.63-.38a1.7 1.7 0 0 0-2.5 1.04l-.16.72a1.7 1.7 0 0 1-3.32 0l-.16-.72a1.7 1.7 0 0 0-2.5-1.04l-.63.38a1.7 1.7 0 0 1-2.35-2.35l.38-.63a1.7 1.7 0 0 0-1.04-2.5l-.72-.16a1.7 1.7 0 0 1 0-3.32l.72-.16a1.7 1.7 0 0 0 1.04-2.5l-.38-.63a1.7 1.7 0 0 1 2.35-2.35l.63.38a1.7 1.7 0 0 0 2.5-1.04l.16-.72Z"
+          />
+          <circle cx="12" cy="12" r="3" />
+        </svg>
+      </button>
+
+      <ExecutionSettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        gateway={gateway}
+        notifier={notifier}
+      />
     </div>
   );
 }
