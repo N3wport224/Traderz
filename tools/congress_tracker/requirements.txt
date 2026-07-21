@@ -1,0 +1,7 @@
+pandas>=2.2
+requests>=2.31
+# urllib3 ships with requests; listed for the Retry import used explicitly.
+urllib3>=2.0
+
+# test-only
+pytest>=8.0
