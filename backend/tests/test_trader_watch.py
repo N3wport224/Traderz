@@ -24,7 +24,16 @@ def make_app() -> tuple[Any, MockExecutionGateway, SystemNotifier]:
     )
     notifier = SystemNotifier(webhook_url=None)
     notifier.webhook_url = None  # belt-and-braces against env leakage
-    app = create_app("sqlite+aiosqlite:///:memory:", gateway=gateway, system_notifier=notifier)
+    # Engines are irrelevant to these tests but share the DB, guard, and
+    # gateway book — pace their tick far beyond the test's lifetime so no
+    # engine round trip can interleave with (and flake) the copy-trade flow.
+    app = create_app(
+        "sqlite+aiosqlite:///:memory:",
+        gateway=gateway,
+        system_notifier=notifier,
+        momentum_interval_seconds=120.0,
+        swing_interval_seconds=120.0,
+    )
     return app, gateway, notifier
 
 

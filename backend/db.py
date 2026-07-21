@@ -192,6 +192,15 @@ class Database:
             _install_sqlite_pragmas(self._engine)
         self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
         self._pending_writes: set[asyncio.Task[None]] = set()
+        # In-memory databases run on ONE shared connection (StaticPool), where
+        # two sessions interleaving BEGIN/COMMIT across await points corrupt
+        # each other's transaction state (transient "cannot start a
+        # transaction within a transaction" 500s). Serialize session scopes at
+        # the event-loop level for that case only — file-backed WAL databases
+        # get a connection per session and keep their full concurrency.
+        self._session_lock: asyncio.Lock | None = (
+            asyncio.Lock() if ":memory:" in self.database_url else None
+        )
 
     async def init(self) -> None:
         """Creates all tables if they don't already exist."""
@@ -204,7 +213,19 @@ class Database:
         session scope. Commits on clean exit, rolls back on any error, always
         releases the connection — every repository method below runs inside it,
         which (together with WAL mode) is what keeps concurrent live-stream
-        writes and frontend analytics reads from ever colliding."""
+        writes and frontend analytics reads from ever colliding. In-memory
+        (single-connection) databases additionally serialize scopes — see
+        `_session_lock` in `__init__`."""
+        if self._session_lock is not None:
+            async with self._session_lock:
+                async with self._session_scope() as session:
+                    yield session
+        else:
+            async with self._session_scope() as session:
+                yield session
+
+    @asynccontextmanager
+    async def _session_scope(self) -> AsyncIterator[AsyncSession]:
         async with self._session_factory() as session:
             try:
                 yield session
