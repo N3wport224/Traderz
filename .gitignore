@@ -8,6 +8,12 @@ venv/
 .mypy_cache/
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
+
+# PyInstaller build output (see build_executable.bat / trading_platform.spec)
+/build/
+/dist/
 
 # Node / Next.js
 node_modules/

@@ -75,6 +75,26 @@ presses, and engine boot; delivery is best-effort and never raises.
 notifier + gateway-provider metadata; the dashboard's System Health bar gains a
 settings cog (execution-provider modal) and a webhook test button. All broker
 and webhook tests run against `httpx.MockTransport` — never the real network.
+Phase 9 adds standalone packaging: the dashboard compiles to a static export
+(`next.config.ts` `output: "export"` → `frontend/out`) that `create_app` mounts
+at `/` via `StaticFiles(html=True)` — registered after every route so `/api/*`
+and `/ws/*` always win — while `frontend/src/lib/api.ts` auto-detects
+same-origin serving (any page not on the :3000 dev server uses relative URLs
+and page-origin WebSockets), unifying the whole app on one port with no Node
+server in production. `backend/utils/paths.py` is the single authority on
+runtime paths: under PyInstaller (`sys.frozen`) read-only resources resolve
+from `sys._MEIPASS` and ALL mutable state (SQLite DB, JSON logs) redirects to
+the per-user app-data dir (`%APPDATA%\Traderz`); dev checkouts stay
+repo-relative. `backend/launcher.py` is the exe entry point: it auto-generates
+a paper-trading `.env` from the bundled `.env.example` when none exists (never
+crashes on a missing file; real env vars always win over file values), starts
+uvicorn on :8000 (PORT overrides), and opens the default browser while the
+console stays as the log window. `trading_platform.spec` +
+`build_executable.bat` produce the one-file `dist\Traderz.exe` (spec bundles
+`frontend/out` → `frontend_dist` and `.env.example`; batch script cleans
+caches, builds the export, runs PyInstaller). Packaging tests simulate frozen
+mode by monkeypatching `sys.frozen`/`sys._MEIPASS` — never skip them for lack
+of a real Windows box.
 
 ## Architecture
 
@@ -128,6 +148,12 @@ and webhook tests run against `httpx.MockTransport` — never the real network.
   - `backend/utils/notifier.py` — `SystemNotifier`: the system-health alert
     channel (guard trips, kill switch, engine boot) to `SYSTEM_WEBHOOK_URL`;
     best-effort, never raises, bounded event history surfaced in telemetry.
+  - `backend/utils/paths.py` — frozen-aware path authority: `sys._MEIPASS`
+    resources vs. per-user app-data for mutable state (DB, logs). Any new
+    file the backend reads or writes must resolve its location here.
+  - `backend/launcher.py` — packaged-executable entry point: `.env`
+    auto-bootstrap (paper-trading defaults), env loading (real env wins),
+    single-port uvicorn boot, browser auto-open.
   - `backend/utils/indicators.py` — pure TA math over `OHLCVBar` sequences (pandas):
     `compute_atr` (rolling-14 True Range mean, `min_periods=1` so early-session
     estimates exist) and `nearest_resistance` (lowest peak-pivot ceiling above a price).
