@@ -41,7 +41,8 @@ from backend.data_pipeline import (
 )
 from backend.db import Database
 from backend.engine.backtester import BacktestError, HistoricalTransport, run_backtest
-from backend.execution_gateway import LiveCCXTExecutionGateway, MockExecutionGateway
+from backend.execution.live_gateway import LiveExecutionGateway
+from backend.execution_gateway import GatewayConfigError, LiveCCXTExecutionGateway, MockExecutionGateway
 from backend.models import ExecutionGateway, OHLCVBar, SignalAction, Timeframe, TradeSignal
 from backend.notifier import ConsoleNotifier, Notifier, WebhookNotifier
 from backend.reconciliation import reconcile_on_boot
@@ -61,10 +62,26 @@ SWING_TICK_SECONDS = 2.0
 MAX_SIGNALS_RETAINED = 500
 
 
-def _build_gateway() -> ExecutionGateway:
+def _build_gateway(risk_manager: RiskManager | None = None) -> ExecutionGateway:
     """Mock by default; set GATEWAY_MODE=live (+ API_KEY/API_SECRET, optional
-    EXCHANGE_ID) to route orders to a real exchange through CCXT."""
-    if os.environ.get("GATEWAY_MODE", "mock").lower() == "live":
+    EXCHANGE_ID) to route orders to a real exchange through CCXT.
+
+    GATEWAY_MODE=PROD_LIVE arms the Phase 8 REST brokerage gateway
+    (`LiveExecutionGateway`) — but only behind a structural double lock: the
+    secondary acknowledgement flag I_AM_RISKING_REAL_MONEY=TRUE must also be
+    set or boot is refused outright. Real-money execution is never something
+    the system drifts into via a single mistyped variable.
+    """
+    mode = os.environ.get("GATEWAY_MODE", "mock").strip().lower()
+    if mode == "prod_live":
+        if os.environ.get("I_AM_RISKING_REAL_MONEY", "").strip().upper() != "TRUE":
+            raise GatewayConfigError(
+                "GATEWAY_MODE=PROD_LIVE refused: real-money execution requires the "
+                "secondary safety flag I_AM_RISKING_REAL_MONEY=TRUE. Remove "
+                "GATEWAY_MODE or set the flag deliberately."
+            )
+        return LiveExecutionGateway(risk_manager=risk_manager)
+    if mode == "live":
         return LiveCCXTExecutionGateway(exchange_id=os.environ.get("EXCHANGE_ID", "binance"))
     return MockExecutionGateway()
 
@@ -174,7 +191,7 @@ def create_app(
     risk_manager = RiskManager()
     notifier = _build_notifier()
     telemetry = TelemetryTracker()
-    execution_gateway = gateway if gateway is not None else _build_gateway()
+    execution_gateway = gateway if gateway is not None else _build_gateway(risk_manager)
     # Phase 8 production alerting: guard trips / kill switch / boot events go
     # out-of-browser through the system webhook (log-only when unconfigured).
     sys_notifier = system_notifier if system_notifier is not None else SystemNotifier()
@@ -393,6 +410,8 @@ def create_app(
             await database.dispose()
             if system_notifier is None:  # close only the client we created
                 await sys_notifier.aclose()
+            if gateway is None and isinstance(execution_gateway, LiveExecutionGateway):
+                await execution_gateway.aclose()
 
     app = FastAPI(title="Traderz Multi-Engine Trading System", lifespan=lifespan)
 
@@ -643,9 +662,19 @@ def create_app(
     async def telemetry_stats() -> dict[str, Any]:
         stats = telemetry.stats()
         stats["persisted_slippage_cost"] = await database.total_slippage_cost()
+        if isinstance(execution_gateway, MockExecutionGateway):
+            gateway_mode, gateway_provider = "mock", "Mock Simulation (paper trading)"
+        elif isinstance(execution_gateway, LiveExecutionGateway):
+            gateway_mode, gateway_provider = "prod_live", "Alpaca-blueprint REST brokerage"
+        else:
+            gateway_mode, gateway_provider = "live", "CCXT exchange"
         stats["gateway"] = {
             "name": execution_gateway.name,
-            "mode": "mock" if isinstance(execution_gateway, MockExecutionGateway) else "live",
+            "mode": gateway_mode,
+            "provider": gateway_provider,
+            "metadata": execution_gateway.describe()
+            if isinstance(execution_gateway, LiveExecutionGateway)
+            else None,
         }
         stats["system_status"] = risk_manager.system_status()
         stats["data_disconnected"] = risk_manager.is_data_disconnected()

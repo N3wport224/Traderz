@@ -200,7 +200,8 @@ def test_telemetry_endpoint_reports_gateway_latency_and_slippage() -> None:
             telemetry = client.get("/api/telemetry").json()
 
         assert telemetry["order_count"] >= 1, "expected at least one order flow within the deadline"
-        assert telemetry["gateway"] == {"name": "MOCK", "mode": "mock"}
+        assert telemetry["gateway"]["name"] == "MOCK"
+        assert telemetry["gateway"]["mode"] == "mock"
         assert telemetry["connection_latency_ms"] > 0
         assert telemetry["cumulative_slippage_cost"] > 0
         assert telemetry["avg_gateway_latency_ms"] > 0
@@ -402,7 +403,8 @@ def test_live_data_mode_remains_paper_trading_with_mock_gateway() -> None:
         telemetry = client.get("/api/telemetry").json()
         assert telemetry["data_source_mode"] == "live"
         assert telemetry["ticker"] == "AAPL"
-        assert telemetry["gateway"] == {"name": "MOCK", "mode": "mock"}  # paper trading
+        assert telemetry["gateway"]["name"] == "MOCK"  # paper trading
+        assert telemetry["gateway"]["mode"] == "mock"
         assert calls["n"] >= 2  # both timeframes polled through the mocked transport
 
 

@@ -93,6 +93,24 @@ def test_trade_count_resets_on_new_day() -> None:
     guard.validate_entry(DAY_2)  # fresh budget
 
 
+def test_backwards_timestamp_never_resets_the_day() -> None:
+    """The day roll is strictly forward-only. Mixed clocks are real: a backtest
+    replays historical bar timestamps while gateway fills carry wall-clock
+    stamps — an earlier date arriving after a later one must not wipe the
+    day's counters or release a lock."""
+    guard = make_guard(max_daily_trade_count=5)
+    guard.register_entry(DAY_2)
+    guard.record_realized_pnl(-5_000.0, DAY_2)  # trips the 3% lock
+    assert guard.locked is True
+
+    guard.roll_day(DAY_1)  # stale/out-of-order timestamp from a replayed bar
+    assert guard.locked is True  # lock survives
+    status = guard.status()
+    assert status["daily_entry_count"] == 1  # counters survive
+    assert status["daily_realized_pnl"] == -5_000.0
+    assert status["current_date"] == DAY_2.date().isoformat()
+
+
 # --- manual circuit breaker ---------------------------------------------------
 
 

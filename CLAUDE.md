@@ -57,7 +57,24 @@ message loop over a keyless public kline stream that parses closed candles into
 queues (drop-oldest; subscription queues register eagerly at `subscribe()`).
 Telemetry exposes `database.journal_mode`, `risk_guard_sync` (memory-vs-DB
 comparison), and websocket stream health/latency; the dashboard header is an
-Infrastructure & Connectivity bar.
+Infrastructure & Connectivity bar. Phase 8 adds the live brokerage gateway and
+production alerting: `backend/execution/live_gateway.py` (`LiveExecutionGateway`)
+maps orders onto an Alpaca-blueprint REST brokerage (`LIVE_BROKER_API_KEY` /
+`LIVE_BROKER_SECRET` / `LIVE_BROKER_URL`), armed ONLY behind the structural
+double lock `GATEWAY_MODE=PROD_LIVE` **and** `I_AM_RISKING_REAL_MONEY=TRUE`
+(anything else refuses to boot). Entries fail fast on broker errors
+(timeouts/5xx → `GatewayError`, 401/403 → `GatewayConfigError`); EXIT orders
+retry with backoff and, on total failure, call `RiskManager.halt()` so the
+platform locks rather than run with unflattened real exposure. RiskGuard
+enforcement and the local open-order/realized-PnL mirror match the mock gateway
+exactly. `backend/utils/notifier.py` (`SystemNotifier`, distinct from the
+per-trade `backend/notifier.py`) pushes ALERT/INFO events to a Discord/Slack
+webhook (`SYSTEM_WEBHOOK_URL`; unset → log-only) on risk-guard trips, kill-switch
+presses, and engine boot; delivery is best-effort and never raises.
+`POST /api/system/notifier/test` fires a connectivity ping and telemetry carries
+notifier + gateway-provider metadata; the dashboard's System Health bar gains a
+settings cog (execution-provider modal) and a webhook test button. All broker
+and webhook tests run against `httpx.MockTransport` — never the real network.
 
 ## Architecture
 
@@ -103,6 +120,14 @@ Infrastructure & Connectivity bar.
   - `backend/reconciliation.py` — `reconcile_on_boot`: diffs the gateway's open
     orders against the `open_positions` table by order id after a crash/restart;
     heals rows missing locally, clears rows already closed at the broker.
+  - `backend/execution/live_gateway.py` — `LiveExecutionGateway`: the Phase 8
+    REST brokerage client (Alpaca-blueprint `POST /v2/orders`, `APCA-*` auth
+    headers) with typed error capture, exit-order retries that halt the
+    platform on total failure, and RiskGuard/book parity with the mock. Only
+    `main.py`'s `_build_gateway` may arm it, behind the PROD_LIVE double lock.
+  - `backend/utils/notifier.py` — `SystemNotifier`: the system-health alert
+    channel (guard trips, kill switch, engine boot) to `SYSTEM_WEBHOOK_URL`;
+    best-effort, never raises, bounded event history surfaced in telemetry.
   - `backend/utils/indicators.py` — pure TA math over `OHLCVBar` sequences (pandas):
     `compute_atr` (rolling-14 True Range mean, `min_periods=1` so early-session
     estimates exist) and `nearest_resistance` (lowest peak-pivot ceiling above a price).

@@ -187,12 +187,20 @@ class RiskGuard:
     # --- clock / state ---------------------------------------------------------
 
     def roll_day(self, timestamp: datetime) -> None:
-        """Resets the daily counters when the bar clock crosses a calendar date.
+        """Resets the daily counters when the clock crosses into a NEW calendar
+        date. Strictly forward-only: an out-of-order or earlier timestamp (e.g.
+        historical bars replayed alongside wall-clock fill stamps) must never
+        reset the day's loss budget or clear a lock — a safety device only
+        relaxes when the day genuinely advances.
 
         A daily-limit lock clears with the new day; the manual circuit breaker
         does not."""
         today = timestamp.date()
-        if self._current_date is None or today != self._current_date:
+        if self._current_date is None:  # first observation adopts the date as-is
+            self._current_date = today
+            self._schedule_persist()
+            return
+        if today > self._current_date:
             self._current_date = today
             self._daily_realized_pnl = 0.0
             self._daily_entry_count = 0
