@@ -94,7 +94,25 @@ console stays as the log window. `trading_platform.spec` +
 `frontend/out` → `frontend_dist` and `.env.example`; batch script cleans
 caches, builds the export, runs PyInstaller). Packaging tests simulate frozen
 mode by monkeypatching `sys.frozen`/`sys._MEIPASS` — never skip them for lack
-of a real Windows box.
+of a real Windows box. Phase 10 adds copy-trading and full-page mode
+workspaces: `backend/trader_watch.py` (`TraderWatchService`) tracks watched
+traders (`watched_traders` / `trader_trade_events` tables) whose buy/sell
+events arrive manually from the dashboard or via the same endpoint as a
+webhook (`POST /api/traders/{id}/events`); every event persists, then notifies
+through the `SystemNotifier` (INFO watch-only, ALERT when mirrored). Each
+trader carries an `auto_follow` toggle + `budget_amount`: when on, BUY events
+mirror instantly through the injected `ExecutionGateway` at budget notional —
+identical RiskGuard enforcement/paper-trading posture as the engines (a locked
+guard downgrades the copy to a recorded, explained skip; enabling auto-follow
+with no positive budget is a 422). SELLs only exit positions actually copied
+from that trader (in-memory `(trader, ticker)` book, original fill size);
+duplicate BUYs / orphan SELLs skip with reasons. `GET /api/traders/feed`
+serves the joined newest-first event feed + open copied positions. The
+dashboard is now five full-page tabs — Day Trading (momentum only), Long-Term
+(swing only), Crypto (both engines on a crypto pair), Copy Trading
+(roster/toggles/log forms/live feed), Analytics & Backtesting — with per-mode
+ticker memory in localStorage: entering Crypto resubscribes the engines to the
+last crypto pair, entering a stock tab switches back.
 
 ## Architecture
 

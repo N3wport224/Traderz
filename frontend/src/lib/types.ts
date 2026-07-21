@@ -154,6 +154,44 @@ export interface BacktestReport {
   risk_guard: RiskGuardStatus | null;
 }
 
+// --- Phase 10: copy trading ---------------------------------------------------
+
+export interface WatchedTrader {
+  id: number;
+  name: string;
+  asset_class: "stock" | "crypto";
+  notes: string;
+  auto_follow: boolean;
+  budget_amount: number;
+  created_at: string | null;
+}
+
+export interface TraderEvent {
+  id: number;
+  trader_id: number;
+  trader_name?: string;
+  ticker: string;
+  action: "BUY" | "SELL";
+  price: number;
+  source: "manual" | "webhook";
+  note: string;
+  timestamp: string | null;
+  followed: boolean;
+  follow_detail: string;
+}
+
+export interface OpenCopiedPosition {
+  trader_id: number;
+  ticker: string;
+  size: number;
+  entry: number;
+}
+
+export interface TraderFeed {
+  events: TraderEvent[];
+  open_copied_positions: OpenCopiedPosition[];
+}
+
 export type GatewayMode = "mock" | "live" | "prod_live";
 
 export interface GatewayMetadata {

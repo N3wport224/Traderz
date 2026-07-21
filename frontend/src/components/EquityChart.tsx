@@ -64,13 +64,17 @@ function EquityPanel({ title, color, data }: EquityPanelProps) {
 interface EquityChartProps {
   momentumEquity: EquityPoint[];
   swingEquity: EquityPoint[];
+  /** Which engine curves to render — mode tabs show only their own engine. */
+  show?: "momentum" | "swing" | "both";
 }
 
-export default function EquityChart({ momentumEquity, swingEquity }: EquityChartProps) {
+export default function EquityChart({ momentumEquity, swingEquity, show = "both" }: EquityChartProps) {
+  const showMomentum = show !== "swing";
+  const showSwing = show !== "momentum";
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <EquityPanel title="Momentum Engine — Equity" color="#34d399" data={momentumEquity} />
-      <EquityPanel title="Swing Engine — Equity" color="#38bdf8" data={swingEquity} />
+    <div className={`grid grid-cols-1 gap-4 ${showMomentum && showSwing ? "md:grid-cols-2" : ""}`}>
+      {showMomentum && <EquityPanel title="Momentum Engine — Equity" color="#34d399" data={momentumEquity} />}
+      {showSwing && <EquityPanel title="Swing Engine — Equity" color="#38bdf8" data={swingEquity} />}
     </div>
   );
 }
