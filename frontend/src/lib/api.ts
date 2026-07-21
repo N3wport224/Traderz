@@ -15,9 +15,31 @@ import type {
   WatchlistState,
 } from "./types";
 
-export const API_BASE_URL: string = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+/** Where the backend API lives.
+ *
+ * - NEXT_PUBLIC_API_BASE_URL, when set at build time, always wins (including
+ *   an explicit empty string for same-origin serving).
+ * - Otherwise, when the page is served by anything other than the Next dev
+ *   server (port 3000) — i.e. the unified single-port build where FastAPI
+ *   serves the static dashboard itself — use the page's own origin via
+ *   relative URLs.
+ * - The Next dev server on :3000 falls back to the local backend on :8000.
+ */
+function resolveApiBase(): string {
+  const configured = process.env.NEXT_PUBLIC_API_BASE_URL;
+  if (configured !== undefined) return configured;
+  if (typeof window !== "undefined" && window.location.port !== "3000") return "";
+  return "http://localhost:8000";
+}
+
+export const API_BASE_URL: string = resolveApiBase();
 
 export function wsUrlFor(channel: EngineChannel): string {
+  if (API_BASE_URL === "") {
+    // Same-origin mode: derive the WebSocket endpoint from the page itself.
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${window.location.host}/ws/${channel}`;
+  }
   const wsBase = API_BASE_URL.replace(/^http/, "ws");
   return `${wsBase}/ws/${channel}`;
 }

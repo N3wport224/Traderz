@@ -24,8 +24,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import StaticPool
 
 from backend.models import OpenPositionRecord, TradeRecord
-
-DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./traderz.db"
+from backend.utils.paths import default_database_url
 
 
 class Base(DeclarativeBase):
@@ -145,7 +144,9 @@ class Database:
     """Owns the async engine/session factory and implements `TradePersistence`."""
 
     def __init__(self, database_url: str | None = None) -> None:
-        self.database_url = database_url or os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+        # Default resolves per runtime: repo-local file in development, the
+        # user's app-data folder when frozen (never write inside the bundle).
+        self.database_url = database_url or os.environ.get("DATABASE_URL") or default_database_url()
         self._engine = create_async_engine(self.database_url, **_engine_kwargs(self.database_url))
         if _is_sqlite(self.database_url):
             _install_sqlite_pragmas(self._engine)

@@ -25,9 +25,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import ConfigStore, ConfigValidationError
@@ -49,6 +51,7 @@ from backend.reconciliation import reconcile_on_boot
 from backend.risk_manager import RiskManager
 from backend.schemas import BacktestRequest, MomentumConfigUpdate, SwingConfigUpdate, WatchlistUpdate
 from backend.utils.notifier import SystemNotifier
+from backend.utils.paths import default_json_log_path, frontend_dist_dir
 from backend.utils.risk_guard import RiskGuard
 from backend.strategies.momentum_engine import MomentumEngine
 from backend.strategies.swing_engine import SwingEngine
@@ -170,6 +173,7 @@ def create_app(
     live_exchange: Any | None = None,
     ws_provider: Any | None = None,
     system_notifier: SystemNotifier | None = None,
+    static_dir: str | None = None,
 ) -> FastAPI:
     """Composition root.
 
@@ -374,7 +378,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        configure_json_logging(json_log_path or os.environ.get("LOG_JSON_PATH", "logging.json"))
+        configure_json_logging(
+            json_log_path or os.environ.get("LOG_JSON_PATH") or str(default_json_log_path())
+        )
         await database.init()
 
         # Crash recovery: diff the gateway's open orders against our persisted
@@ -733,6 +739,19 @@ def create_app(
                 await websocket.receive_text()
         except WebSocketDisconnect:
             swing_state.connections.disconnect(websocket)
+
+    # --- unified single-port serving (Phase 9) --------------------------------
+    # Mount the compiled static dashboard (Next.js `output: "export"`) at the
+    # root URL. Registered LAST, so every /api/* and /ws/* route above wins the
+    # match first — the mount only catches what the API didn't claim. When the
+    # frontend hasn't been built (dev checkouts, API-only tests) the directory
+    # doesn't exist and the app simply runs API-only.
+    dashboard_dir = Path(static_dir) if static_dir is not None else frontend_dist_dir()
+    if dashboard_dir.is_dir():
+        app.mount("/", StaticFiles(directory=str(dashboard_dir), html=True), name="dashboard")
+        logger.info(
+            "serving static dashboard", extra={"event": "static_dashboard", "path": str(dashboard_dir)}
+        )
 
     return app
 
