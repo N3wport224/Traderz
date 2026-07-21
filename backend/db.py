@@ -107,6 +107,46 @@ class SystemState(Base):
     updated_at: Mapped[datetime] = mapped_column()
 
 
+class WatchedTrader(Base):
+    """Phase 10 copy-trading: a person whose trades the user mirrors or logs.
+
+    `auto_follow` + `budget_amount` drive the optional mirroring: when enabled,
+    every incoming BUY/SELL event for this trader immediately places a
+    `budget_amount`-notional paper order through the execution gateway (subject
+    to the RiskGuard, exactly like an engine entry). When disabled the event is
+    recorded + notified only — the manual mode.
+    """
+
+    __tablename__ = "watched_traders"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    asset_class: Mapped[str] = mapped_column(String(8), default="stock")  # stock | crypto
+    notes: Mapped[str] = mapped_column(String(200), default="")
+    auto_follow: Mapped[bool] = mapped_column(Boolean, default=False)
+    budget_amount: Mapped[float] = mapped_column(Float, default=0.0)  # $ notional per copied trade
+    created_at: Mapped[datetime] = mapped_column()
+
+
+class TraderTradeEvent(Base):
+    """One observed buy/sell by a watched trader (manually logged in the UI or
+    pushed by an external integration via the webhook endpoint), plus what the
+    platform did about it (notified only, or auto-followed with a fill)."""
+
+    __tablename__ = "trader_trade_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    trader_id: Mapped[int] = mapped_column(Integer, index=True)
+    ticker: Mapped[str] = mapped_column(String(16))
+    action: Mapped[str] = mapped_column(String(8))  # BUY | SELL
+    price: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(16), default="manual")  # manual | webhook
+    note: Mapped[str] = mapped_column(String(200), default="")
+    timestamp: Mapped[datetime] = mapped_column(index=True)
+    followed: Mapped[bool] = mapped_column(Boolean, default=False)
+    follow_detail: Mapped[str] = mapped_column(String(200), default="")
+
+
 def _engine_kwargs(database_url: str) -> dict[str, object]:
     if ":memory:" in database_url:
         # A single shared in-memory connection so all sessions see the same data.
@@ -375,3 +415,116 @@ class Database:
             )
             row = result.scalar_one_or_none()
             return row if row is not None else 0.0
+
+    # --- Phase 10: copy-trading (watched traders + their trade events) ---------
+
+    @staticmethod
+    def _trader_to_dict(row: WatchedTrader) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "name": row.name,
+            "asset_class": row.asset_class,
+            "notes": row.notes,
+            "auto_follow": row.auto_follow,
+            "budget_amount": row.budget_amount,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+
+    @staticmethod
+    def _event_to_dict(row: TraderTradeEvent) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "trader_id": row.trader_id,
+            "ticker": row.ticker,
+            "action": row.action,
+            "price": row.price,
+            "source": row.source,
+            "note": row.note,
+            "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+            "followed": row.followed,
+            "follow_detail": row.follow_detail,
+        }
+
+    async def add_trader(self, name: str, asset_class: str, notes: str) -> dict[str, Any]:
+        async with self.get_db_session() as session:
+            row = WatchedTrader(
+                name=name,
+                asset_class=asset_class,
+                notes=notes,
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(row)
+            await session.flush()  # populate the autoincrement id before commit
+            return self._trader_to_dict(row)
+
+    async def list_traders(self) -> list[dict[str, Any]]:
+        async with self.get_db_session() as session:
+            result = await session.execute(select(WatchedTrader).order_by(WatchedTrader.created_at))
+            return [self._trader_to_dict(row) for row in result.scalars().all()]
+
+    async def get_trader(self, trader_id: int) -> dict[str, Any] | None:
+        async with self.get_db_session() as session:
+            row = await session.get(WatchedTrader, trader_id)
+            return self._trader_to_dict(row) if row is not None else None
+
+    async def update_trader_follow(
+        self, trader_id: int, auto_follow: bool, budget_amount: float
+    ) -> dict[str, Any] | None:
+        async with self.get_db_session() as session:
+            row = await session.get(WatchedTrader, trader_id)
+            if row is None:
+                return None
+            row.auto_follow = auto_follow
+            row.budget_amount = budget_amount
+            return self._trader_to_dict(row)
+
+    async def delete_trader(self, trader_id: int) -> bool:
+        """Removes the trader and their event history in one transaction."""
+        async with self.get_db_session() as session:
+            row = await session.get(WatchedTrader, trader_id)
+            if row is None:
+                return False
+            await session.execute(
+                delete(TraderTradeEvent).where(TraderTradeEvent.trader_id == trader_id)
+            )
+            await session.delete(row)
+            return True
+
+    async def record_trader_event(
+        self,
+        trader_id: int,
+        ticker: str,
+        action: str,
+        price: float,
+        source: str,
+        note: str,
+        *,
+        followed: bool,
+        follow_detail: str,
+    ) -> dict[str, Any]:
+        async with self.get_db_session() as session:
+            row = TraderTradeEvent(
+                trader_id=trader_id,
+                ticker=ticker,
+                action=action,
+                price=price,
+                source=source,
+                note=note,
+                timestamp=datetime.now(timezone.utc),
+                followed=followed,
+                follow_detail=follow_detail,
+            )
+            session.add(row)
+            await session.flush()
+            return self._event_to_dict(row)
+
+    async def list_trader_events(
+        self, trader_id: int | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Newest-first event feed, optionally scoped to one trader."""
+        async with self.get_db_session() as session:
+            query = select(TraderTradeEvent).order_by(TraderTradeEvent.id.desc()).limit(limit)
+            if trader_id is not None:
+                query = query.where(TraderTradeEvent.trader_id == trader_id)
+            result = await session.execute(query)
+            return [self._event_to_dict(row) for row in result.scalars().all()]

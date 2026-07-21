@@ -49,7 +49,16 @@ from backend.models import ExecutionGateway, OHLCVBar, SignalAction, Timeframe, 
 from backend.notifier import ConsoleNotifier, Notifier, WebhookNotifier
 from backend.reconciliation import reconcile_on_boot
 from backend.risk_manager import RiskManager
-from backend.schemas import BacktestRequest, MomentumConfigUpdate, SwingConfigUpdate, WatchlistUpdate
+from backend.schemas import (
+    BacktestRequest,
+    MomentumConfigUpdate,
+    SwingConfigUpdate,
+    TraderCreate,
+    TraderEventCreate,
+    TraderFollowUpdate,
+    WatchlistUpdate,
+)
+from backend.trader_watch import TraderWatchService
 from backend.utils.notifier import SystemNotifier
 from backend.utils.paths import default_json_log_path, frontend_dist_dir
 from backend.utils.risk_guard import RiskGuard
@@ -199,6 +208,9 @@ def create_app(
     # Phase 8 production alerting: guard trips / kill switch / boot events go
     # out-of-browser through the system webhook (log-only when unconfigured).
     sys_notifier = system_notifier if system_notifier is not None else SystemNotifier()
+    # Phase 10 copy-trading: watched traders' events notify and (optionally)
+    # mirror through the same gateway + RiskGuard as the engines.
+    trader_watch = TraderWatchService(database, execution_gateway, sys_notifier)
 
     def _alert_async(title: str, message: str, **context: Any) -> None:
         """Schedules an alert without blocking the (sync) hot path caller."""
@@ -459,6 +471,64 @@ def create_app(
     async def swing_trades() -> list[dict[str, Any]]:
         rows = await database.get_trades(SwingEngine.ENGINE_TYPE, asset_ticker=watch["symbol"])
         return [_trade_to_json(row) for row in rows]
+
+    # --- Phase 10: copy-trading ("Trader Watch") ------------------------------
+
+    @app.get("/api/traders")
+    async def list_traders() -> list[dict[str, Any]]:
+        return await database.list_traders()
+
+    @app.post("/api/traders", status_code=201)
+    async def create_trader(body: TraderCreate) -> dict[str, Any]:
+        for existing in await database.list_traders():
+            if existing["name"].lower() == body.name.lower():
+                raise HTTPException(status_code=409, detail=f"already watching '{existing['name']}'")
+        return await database.add_trader(body.name, body.asset_class, body.notes)
+
+    @app.delete("/api/traders/{trader_id}")
+    async def remove_trader(trader_id: int) -> dict[str, Any]:
+        if not await database.delete_trader(trader_id):
+            raise HTTPException(status_code=404, detail="unknown trader")
+        return {"deleted": trader_id}
+
+    @app.put("/api/traders/{trader_id}/follow")
+    async def update_trader_follow(trader_id: int, body: TraderFollowUpdate) -> dict[str, Any]:
+        """The auto-follow toggle. Turning mirroring ON requires a positive
+        budget — a copy order must have a definite dollar size."""
+        if body.auto_follow and body.budget_amount <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail="set a budget amount (dollars per copied trade) to enable auto-follow",
+            )
+        updated = await database.update_trader_follow(trader_id, body.auto_follow, body.budget_amount)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="unknown trader")
+        return updated
+
+    @app.post("/api/traders/{trader_id}/events", status_code=201)
+    async def log_trader_event(trader_id: int, body: TraderEventCreate) -> dict[str, Any]:
+        """Records one observed buy/sell by a watched trader.
+
+        Called by the dashboard's manual "log trade" form, and equally usable
+        as a webhook by any external integration (set source="webhook")."""
+        trader = await database.get_trader(trader_id)
+        if trader is None:
+            raise HTTPException(status_code=404, detail="unknown trader")
+        return await trader_watch.log_event(
+            trader, body.ticker, body.action, body.price, body.source, body.note
+        )
+
+    @app.get("/api/traders/feed")
+    async def trader_feed(limit: int = 50) -> dict[str, Any]:
+        """Newest-first event feed across all watched traders, with names
+        joined in and the service's open copied positions."""
+        limit = max(1, min(limit, 200))
+        traders = {t["id"]: t for t in await database.list_traders()}
+        events = await database.list_trader_events(limit=limit)
+        for event in events:
+            trader = traders.get(event["trader_id"])
+            event["trader_name"] = trader["name"] if trader else "(removed)"
+        return {"events": events, **trader_watch.status()}
 
     @app.get("/api/brackets")
     async def active_brackets() -> list[dict[str, Any]]:
