@@ -10,7 +10,9 @@ sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
 greenlet>=3.0
 
-# Optional — only needed for live trading (GATEWAY_MODE=live). The
-# LiveCCXTExecutionGateway imports ccxt lazily, so mock-mode installs
-# (development, CI, tests) can skip it entirely.
-# ccxt>=4.3
+# Required for LIVE CRYPTO market data (DATA_SOURCE_MODE=live with a crypto
+# pair polls public CCXT OHLCV) and for live crypto execution
+# (GATEWAY_MODE=live). Imported lazily, so pure-mock installs still run
+# without it — but without it the live BTC/USDT feed reports
+# DATA_DISCONNECTED, so it ships installed by default.
+ccxt>=4.3

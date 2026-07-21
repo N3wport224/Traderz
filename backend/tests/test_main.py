@@ -140,7 +140,10 @@ def test_momentum_pipeline_persists_trades_and_equity_reachable_via_api() -> Non
         # one being visible implies the other already is too.
         trades: list[dict[str, Any]] = []
         equity: list[dict[str, Any]] = []
-        deadline = time.monotonic() + 10.0
+        # Generous deadline: the mock feed is a random walk, so how quickly the
+        # ORB strategy completes a breakout + exit round trip is stochastic —
+        # rarely (observed ~1 in 30 full runs) 10s wasn't enough.
+        deadline = time.monotonic() + 25.0
         while time.monotonic() < deadline and not (trades and equity):
             time.sleep(0.1)
             trades = client.get("/api/momentum/trades").json()
